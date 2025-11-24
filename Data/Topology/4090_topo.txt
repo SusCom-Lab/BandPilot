@@ -1,0 +1,10 @@
+| GPU0    | GPU0    | GPU1    | GPU2    | GPU3    | GPU4    | GPU5    | GPU6    | GPU7    |
+|---|---|---|---|---|---|---|---|---|
+| GPU0    | X    | PXB    | PXB    | PXB    | SYS    | SYS    | SYS    | SYS    |
+| GPU1    | PXB    | X    | PXB    | PXB    | SYS    | SYS    | SYS    | SYS    |
+| GPU2    | PXB    | PXB    | X    | PIX    | SYS    | SYS    | SYS    | SYS    |
+| GPU3    | PXB    | PXB    | PIX    | X    | SYS    | SYS    | SYS    | SYS    |
+| GPU4    | SYS    | SYS    | SYS    | SYS    | X    | PXB    | PXB    | PXB    |
+| GPU5    | SYS    | SYS    | SYS    | SYS    | PXB    | X    | PXB    | PXB    |
+| GPU6    | SYS    | SYS    | SYS    | SYS    | PXB    | PXB    | X    | PIX    |
+| GPU7    | SYS    | SYS    | SYS    | SYS    | PXB    | PXB    | PIX    | X    |

@@ -1,0 +1,53 @@
+# 数据路径
+data:
+  h100_data_path: './Data/H100_Real/Pune_H100_16M_binary.csv'
+  bandwidth_dict_dir: './Data/Bandwidth'
+  model_save_dir: './model/H100_Real'
+  evaluation_dir: './Data/Evaluation/H100_Real'
+
+# 模型参数（将 type 设为 'full' 可启用 BandwidthPredictor，用于运行利用率/累积评估）
+model:
+  type: 'full'
+  hidden_dim: 32
+  num_layers: 6
+  num_heads: 8
+  dropout: 0.05
+  node_count_embedding_dim: 8
+
+# 训练参数
+training:
+  batch_size: 100
+  num_epochs: 300
+  learning_rate: 0.001
+  weight_decay: 0.00001
+  patience: 50
+  lambda_ewc: 2.0
+  num_train_samples: 2000
+  num_test_samples: 1000
+
+# 集群配置
+cluster:
+  total_gpu: 32
+  cluster_types:
+    - 'H100_26H100_27H100_28H100_29'
+  bw_switch: 20
+
+# 评估配置（仅当 model.type = 'full' 时才会执行 compare.py 中的对比逻辑）
+evaluation:
+  enable_utilization: false   # true: 生成 Part_mean_* (带宽占比)
+  enable_accumulation: false  # true: 生成 Part_sum_* (与最优差距)
+  enable_multi_tenant: true # true: 运行多租户仿真，生成 multi_tenant_simulation.csv
+  repeat_num: 50              # 每个 test_num 的采样次数
+  if_dynamic: true            # true 表示可用 GPU 数量随机波动，false 表示所有 GPU 可用
+  
+  # 多租户仿真配置
+  multi_tenant:
+    workload_mode: 'fixed_sum'  # 'fixed_sum': 生成总和为 total_gpu_sum 的随机序列; 'random': 随机生成 num_jobs 个任务
+    total_gpu_sum: 32           # fixed_sum 模式下的总GPU数
+    num_jobs: 10                # random 模式下的任务数量
+    job_sizes: [2, 4, 6, 10, 12, 14]     # 允许的任务大小列表
+    repeat_num: 100            # 重复仿真次数
+
+# 其他
+random_seed: 456
+device: 'cuda'
