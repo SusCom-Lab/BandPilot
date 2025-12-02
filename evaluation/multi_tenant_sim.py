@@ -294,6 +294,7 @@ def run_multi_tenant_simulation(
     artifact_dir: Path,
     device: torch.device,
     search_algo: Callable,
+    contention_mode: str = "intensive",
     workload_mode: str = "fixed_sum",
     total_gpu_sum: int = 32,
     num_jobs: int = 10,
@@ -303,6 +304,7 @@ def run_multi_tenant_simulation(
     random_seed: Optional[int] = None,
     cluster_type: Optional[str] = None,
     workload_sequences: Optional[List[List[int]]] = None,
+    progress_callback: Optional[Callable[[int], None]] = None,
 ) -> pd.DataFrame:
     """运行多租户仿真，模拟多个任务依次到达并分配GPU资源。
     
@@ -329,6 +331,10 @@ def run_multi_tenant_simulation(
         artifact_dir: 模型和scaler文件所在目录
         device: PyTorch设备（CPU或CUDA）
         search_algo: 搜索算法函数，签名应为 (num_dimensions, avail_gpu, gpu_need, cluster_manager=None) -> Optional[np.ndarray]
+        contention_mode: 争用模式。
+            - "intensive": 假设各任务满负载，跨节点任务按照瓶颈容量瓜分带宽
+            - "common": 模拟实时中等带宽占用，每个任务随机取 25%~50% 峰值作为需求再做争用
+            - "idle": 认为所有任务错峰运行，不发生争用
         workload_mode: 工作负载生成模式（'fixed_sum' 或 'random'）
         total_gpu_sum: fixed_sum 模式下的总GPU数
         num_jobs: random 模式下的任务数量
@@ -339,6 +345,7 @@ def run_multi_tenant_simulation(
         cluster_type: 集群类型（可选，某些算法需要）
         workload_sequences: 预生成的工作负载序列列表（可选），如果提供则使用，否则内部生成。
             应该是一个长度为 repeat_num 的列表，每个元素是一个任务大小列表。
+        progress_callback: 可选回调函数，在每次 repeat 完成后调用，用于更新外部进度条。
     
     Returns:
         pandas DataFrame，包含以下列：
@@ -373,6 +380,18 @@ def run_multi_tenant_simulation(
         search_mode_str = "真实数据" if search_if_real_data else "模型预测"
         logger.info(f"--- 阶段一：搜索阶段（使用{search_mode_str}） ---")
         
+        # 重要：无论是否使用预提供的workload，都需要设置随机种子，确保算法内部的随机操作一致
+        # 这对于公平对比不同算法至关重要
+        current_seed = None
+        if random_seed is not None:
+            current_seed = random_seed + repeat_id
+            # 设置 numpy 和 python random 的随机种子，确保算法内部的随机操作也使用正确的种子
+            np.random.seed(current_seed)
+            random.seed(current_seed)
+        
+        # 为本次 repeat 生成一个占用比率种子，确保搜索与评估阶段共享相同的随机序列
+        occupancy_seed = current_seed if current_seed is not None else int(np.random.randint(0, 2**31 - 1))
+        
         # 创建用于搜索的 ClusterStateManager（根据 search_if_real_data 配置）
         search_predictor = create_bandwidth_predictor(
             if_real_data=search_if_real_data,
@@ -388,16 +407,9 @@ def run_multi_tenant_simulation(
         search_manager = ClusterStateManager(
             total_gpu=total_gpu,
             bandwidth_predictor=search_predictor,
+            contention_mode=contention_mode,
+            occupancy_seed=occupancy_seed,
         )
-        
-        # 重要：无论是否使用预提供的workload，都需要设置随机种子，确保算法内部的随机操作一致
-        # 这对于公平对比不同算法至关重要
-        current_seed = None
-        if random_seed is not None:
-            current_seed = random_seed + repeat_id
-            # 设置 numpy 和 python random 的随机种子，确保算法内部的随机操作也使用正确的种子
-            np.random.seed(current_seed)
-            random.seed(current_seed)
         
         # 生成或使用预提供的工作负载序列
         if workload_sequences is not None:
@@ -441,12 +453,16 @@ def run_multi_tenant_simulation(
                 break
             
             # 2. 搜索最优 Placement（使用传入的搜索算法，感知多租户争用）
-            best_combo = search_algo(
-                num_dimensions=total_gpu,
-                avail_gpu=avail_gpu,
-                gpu_need=gpu_need,
-                cluster_manager=search_manager,
-            )
+            search_manager.set_job_context(job_idx)
+            try:
+                best_combo = search_algo(
+                    num_dimensions=total_gpu,
+                    avail_gpu=avail_gpu,
+                    gpu_need=gpu_need,
+                    cluster_manager=search_manager,
+                )
+            finally:
+                search_manager.clear_job_context()
             
             if best_combo is None:
                 logger.error(f"未能找到任务 {job_idx} 的合适组合")
@@ -522,6 +538,8 @@ def run_multi_tenant_simulation(
         eval_manager = ClusterStateManager(
             total_gpu=total_gpu,
             bandwidth_predictor=eval_predictor,
+            contention_mode=contention_mode,
+            occupancy_seed=occupancy_seed,
         )
         
         # 按照相同的顺序重新分配所有任务，使用真实数据计算带宽
@@ -616,6 +634,9 @@ def run_multi_tenant_simulation(
                     f"任务 {job['job_id']} 在真实数据下经历了争用: "
                     f"{job['standalone_bw']:.2f} -> {job['current_bw']:.2f}"
                 )
+        
+        if progress_callback is not None:
+            progress_callback(repeat_id)
     
     # 转换为 DataFrame
     df = pd.DataFrame(all_results)
@@ -717,6 +738,8 @@ def _evaluate_patterns_with_manager(
     total_gpu: int,
     bandwidth_predictor: Callable[[np.ndarray], float],
     node_size: int = 8,
+    contention_mode: str = "intensive",
+    occupancy_seed: Optional[int] = None,
 ) -> Tuple[float, List[Tuple[np.ndarray, float, float]]]:
     """
     对一组 patterns 做精确叶子评估：
@@ -725,10 +748,19 @@ def _evaluate_patterns_with_manager(
     返回：
       total_throughput,
       per_job[(combo, standalone_bw, final_bw)]
+
+    Args:
+        contention_mode: 传递给 ClusterStateManager 的争用模式
+        occupancy_seed: 控制 common 模式下占用比率的基准种子，确保多次评估一致
     """
     combos = _counts_solution_to_combos(patterns, total_gpu, node_size)
 
-    manager = ClusterStateManager(total_gpu=total_gpu, bandwidth_predictor=bandwidth_predictor)
+    manager = ClusterStateManager(
+        total_gpu=total_gpu,
+        bandwidth_predictor=bandwidth_predictor,
+        contention_mode=contention_mode,
+        occupancy_seed=occupancy_seed,
+    )
 
     per_job: List[Tuple[np.ndarray, float, float]] = []
     total_throughput = 0.0
@@ -748,6 +780,8 @@ def minlp_offline_optimal_solver(
     bandwidth_predictor: Callable[[np.ndarray], float],
     node_size: int = 8,
     verbose: bool = False,
+    contention_mode: str = "intensive",
+    occupancy_seed: Optional[int] = None,
 ) -> Tuple[List[np.ndarray], List[float], List[float], float]:
     """
     离线全局最优（GroundTruth）求解：
@@ -757,6 +791,9 @@ def minlp_offline_optimal_solver(
       - predicted_standalone_bws
       - predicted_final_bws（按你的争用规则）
       - best_total_throughput
+
+    Args:
+        contention_mode: 传递给 ClusterStateManager 的争用模式
     """
     num_nodes = total_gpu // node_size
 
@@ -808,7 +845,12 @@ def minlp_offline_optimal_solver(
         if len(chosen) > 0:
             try:
                 actual_total, _ = _evaluate_patterns_with_manager(
-                    chosen, total_gpu, bandwidth_predictor, node_size=node_size
+                    chosen,
+                    total_gpu,
+                    bandwidth_predictor,
+                    node_size=node_size,
+                    contention_mode=contention_mode,
+                    occupancy_seed=occupancy_seed,
                 )
                 ub = actual_total
             except Exception as e:
@@ -839,7 +881,12 @@ def minlp_offline_optimal_solver(
                 # 评估这些pattern组合的实际总带宽
                 if remaining_patterns:
                     remaining_total, _ = _evaluate_patterns_with_manager(
-                        remaining_patterns, total_gpu, bandwidth_predictor, node_size=node_size
+                        remaining_patterns,
+                        total_gpu,
+                        bandwidth_predictor,
+                        node_size=node_size,
+                        contention_mode=contention_mode,
+                        occupancy_seed=occupancy_seed,
                     )
                     ub += remaining_total
             except Exception:
@@ -876,7 +923,12 @@ def minlp_offline_optimal_solver(
             # 叶子节点：评估完整解
             nodes_evaluated += 1
             obj, _ = _evaluate_patterns_with_manager(
-                chosen, total_gpu, bandwidth_predictor, node_size=node_size
+                chosen,
+                total_gpu,
+                bandwidth_predictor,
+                node_size=node_size,
+                contention_mode=contention_mode,
+                occupancy_seed=occupancy_seed,
             )
             if obj > best_obj:
                 best_obj = obj
@@ -917,7 +969,12 @@ def minlp_offline_optimal_solver(
 
     # 5) 从 best_patterns 得到 combos 和带宽（按 manager 精确重算）
     best_total_throughput, per_job = _evaluate_patterns_with_manager(
-        best_patterns, total_gpu, bandwidth_predictor, node_size=node_size
+        best_patterns,
+        total_gpu,
+        bandwidth_predictor,
+        node_size=node_size,
+        contention_mode=contention_mode,
+        occupancy_seed=occupancy_seed,
     )
     best_combos = [x[0] for x in per_job]
     predicted_standalone_bws = [x[1] for x in per_job]
@@ -947,6 +1004,8 @@ def brute_force_optimal_solver(
     verbose: bool = False,
     max_combinations: int = 1000000,  # 限制组合数量，避免超时
     brute_force_concrete=True, 
+    contention_mode: str = "intensive",
+    occupancy_seed: Optional[int] = None,
 ) -> Tuple[List[np.ndarray], List[float], List[float], float]:
     """
     暴力搜索全局最优解（GroundTruth）：
@@ -960,6 +1019,10 @@ def brute_force_optimal_solver(
       - predicted_standalone_bws
       - predicted_final_bws（按你的争用规则）
       - best_total_throughput
+
+    Args:
+        contention_mode: 传递给 ClusterStateManager 的争用模式
+        occupancy_seed: 控制 common 模式下占用比率的基准种子，确保多次评估一致
     """
     num_nodes = total_gpu // node_size
     
@@ -1014,7 +1077,12 @@ def brute_force_optimal_solver(
             # 评估这个组合（容量约束已在递归过程中检查）
             try:
                 obj, _ = _evaluate_patterns_with_manager(
-                    chosen, total_gpu, bandwidth_predictor, node_size=node_size
+                    chosen,
+                    total_gpu,
+                    bandwidth_predictor,
+                    node_size=node_size,
+                    contention_mode=contention_mode,
+                    occupancy_seed=occupancy_seed,
                 )
                 if obj > best_obj:
                     best_obj = obj
@@ -1059,7 +1127,12 @@ def brute_force_optimal_solver(
     
     # 4) 从 best_patterns 得到 combos 和带宽（按 manager 精确重算）
     best_total_throughput, per_job = _evaluate_patterns_with_manager(
-        best_patterns, total_gpu, bandwidth_predictor, node_size=node_size
+        best_patterns,
+        total_gpu,
+        bandwidth_predictor,
+        node_size=node_size,
+        contention_mode=contention_mode,
+        occupancy_seed=occupancy_seed,
     )
     best_combos = [x[0] for x in per_job]
     predicted_standalone_bws = [x[1] for x in per_job]
@@ -1084,6 +1157,7 @@ def run_multi_tenant_simulation_offline_minlp(
     data_path: str,
     artifact_dir: Path,
     device: torch.device,
+    contention_mode: str = "intensive",
     workload_mode: str = "fixed_sum",
     total_gpu_sum: int = 32,
     num_jobs: int = 10,
@@ -1094,10 +1168,15 @@ def run_multi_tenant_simulation_offline_minlp(
     cluster_type: Optional[str] = None,
     workload_sequences: Optional[List[List[int]]] = None,
     use_brute_force: bool = False,  # 是否使用暴力搜索（用于小规模问题验证）
+    progress_callback: Optional[Callable[[int], None]] = None,
 ) -> pd.DataFrame:
     """
     离线 MINLP GroundTruth 的多租户仿真：
     输出 df 与 run_multi_tenant_simulation 完全一致，便于 compare.py 统一对比。
+    
+    Args:
+        contention_mode: 争用模式（与在线仿真保持一致）
+        progress_callback: 可选回调函数，在每次 repeat 完成后调用，用于更新外部进度条。
     """
     if job_sizes is None:
         job_sizes = [1, 2, 4, 8]
@@ -1117,6 +1196,8 @@ def run_multi_tenant_simulation_offline_minlp(
             np.random.seed(current_seed)
             import random as _random
             _random.seed(current_seed)
+
+        occupancy_seed = current_seed if current_seed is not None else int(np.random.randint(0, 2**31 - 1))
 
         if workload_sequences is not None:
             workload_requests = workload_sequences[repeat_id]
@@ -1161,6 +1242,8 @@ def run_multi_tenant_simulation_offline_minlp(
                 bandwidth_predictor=search_predictor,
                 node_size=8,
                 verbose=False,
+                contention_mode=contention_mode,
+                occupancy_seed=occupancy_seed,
             )
         else:
             logger.info("[MINLP] 使用Branch-and-Bound算法")
@@ -1170,6 +1253,8 @@ def run_multi_tenant_simulation_offline_minlp(
                 bandwidth_predictor=search_predictor,
                 node_size=8,
                 verbose=False,
+                contention_mode=contention_mode,
+                occupancy_seed=occupancy_seed,
             )
 
         search_results = []
@@ -1197,7 +1282,12 @@ def run_multi_tenant_simulation_offline_minlp(
             device=None,
             artifact_dir=None,
         )
-        eval_manager = ClusterStateManager(total_gpu=total_gpu, bandwidth_predictor=eval_predictor)
+        eval_manager = ClusterStateManager(
+            total_gpu=total_gpu,
+            bandwidth_predictor=eval_predictor,
+            contention_mode=contention_mode,
+            occupancy_seed=occupancy_seed,
+        )
 
         for search_result in search_results:
             job_idx = search_result["job_idx"]
@@ -1238,6 +1328,9 @@ def run_multi_tenant_simulation_offline_minlp(
                 "num_active_jobs": num_active_jobs,
             }
             all_results.append(result)
+
+        if progress_callback is not None:
+            progress_callback(repeat_id)
 
     df = pd.DataFrame(all_results)
     if repeat_num == 1 and "repeat_id" in df.columns:

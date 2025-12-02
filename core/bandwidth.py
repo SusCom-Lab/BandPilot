@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+import math
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 
@@ -23,6 +24,7 @@ class SwitchBandwidthConfig:
     """交换机带宽配置类。"""
 
     num_machines: int
+    cluster_type: str | None = None
     bw_matrix: np.ndarray = field(init=False)
 
     def __post_init__(self) -> None:
@@ -77,13 +79,31 @@ def load_gpu_bw_dict(file_path: Path) -> Dict:
     return data
 
 
+CUSTOM_CLUSTER_NODE_TYPES = {
+    "Het-4Mix": ["4090", "V100", "A6000","A800"],
+}
+
+
+def _expand_gpu_types_for_nodes(node_types: Sequence[str], repeat: int) -> List[str]:
+    if repeat <= 0 or not node_types:
+        return []
+    cycles = math.ceil(repeat / len(node_types))
+    ordered = list(node_types) * cycles
+    return [f"{gpu}_gpu_bw_dict.pkl" for gpu in ordered[:repeat]]
+
+
 def get_gpu_dict_files(cluster_type: str, repeat: int) -> List[str]:
     """根据集群类型列举需要的带宽字典文件。"""
+    if cluster_type in CUSTOM_CLUSTER_NODE_TYPES:
+        node_types = CUSTOM_CLUSTER_NODE_TYPES[cluster_type]
+        return _expand_gpu_types_for_nodes(node_types, repeat)
+
     known_gpu_types = ["4090", "V100", "A6000", "A800", "H100_26", "H100_27", "H100_28", "H100_29"]
     gpu_types = [gpu for gpu in known_gpu_types if gpu in cluster_type]
     if not gpu_types:
         logger.warning("cluster_type中未发现已知GPU类型: %s", cluster_type)
-    return [f"{gpu}_gpu_bw_dict.pkl" for gpu in gpu_types] * repeat
+        return []
+    return _expand_gpu_types_for_nodes(gpu_types, repeat)
 
 
 def get_gpu_counts_for_model(gpu_config: np.ndarray, total_gpu: int) -> Tuple[List[int], int]:
@@ -163,6 +183,17 @@ def calculate_bandwidth_values(
     for idx, part_tuple in enumerate(parts):
         current_dict = gpu_bw_dict_list[idx]
         part_bandwidths.append(float(round(current_dict.get(part_tuple, 0.0), 2)))
+
+    cluster_label = getattr(switch_config, "cluster_type", None)
+    if cluster_label in CUSTOM_CLUSTER_NODE_TYPES:
+        active_bws = [
+            part_bandwidths[idx]
+            for idx, part in enumerate(parts)
+            if any(part)
+        ]
+        if active_bws:
+            intra_bottleneck = min(active_bws)
+            final_bandwidth = float(min(final_bandwidth, intra_bottleneck))
 
     return final_bandwidth, part_bandwidths, switch_config
 

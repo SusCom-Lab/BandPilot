@@ -62,6 +62,7 @@ python main.py --config config/default_config.yaml
 - `job_sizes`: 允许的任务大小列表（默认 `[1, 2, 4, 8]`）
 - `repeat_num`: 重复仿真次数（默认1）
 - `if_real_data`: 是否使用真实数据（默认false，使用模型预测）
+- `contention_mode`: 争用模式（`'intensive'`：满负载争用；`'common'`：实时中等占用，任务随机取 25%~50% 峰值作为需求再做争用；`'idle'`：认为任务错峰，不发生争用）
 
 **输出文件**: `Data/Evaluation/{cluster_type}/multi_tenant_simulation.csv`
 
@@ -94,7 +95,13 @@ evaluation:
     job_sizes: [1, 2, 4, 8]
     repeat_num: 1
     if_real_data: false
+    contention_mode: 'intensive'
 ```
+
+**关于 `contention_mode='common'`：**
+- 每个任务在提交时会基于其独占带宽随机采样一份 25%~50% 的“实时占用带宽”，这模拟中等偏低的流量强度。
+- 争用计算以占用带宽为需求量，再结合瓶颈容量决定最终带宽；若不存在争用，任务保持其占用带宽。
+- 采用 `np.random.seed`（或 python `random.seed`）即可确保多次仿真时采样结果可复现。
 
 ## 依赖
 
@@ -110,6 +117,19 @@ pip install -r requirements.txt
 
 - `SC_BandPilot/Data`：带宽CSV、拓扑文件等
 - `SC_BandPilot/model`：模型参数及 scaler artifacts 输出目录
+
+## Het-4Mix 集群
+
+- `Het-4Mix` 将 4090 / A800 / A6000 / V100 四台 8 卡服务器拼成 32 卡异构集群，可直接在 `config/default_config.yaml` 的 `cluster.cluster_types` 中和 H100 组合同时配置，例如：
+  ```yaml
+  cluster:
+    total_gpu: 32
+    cluster_types:
+      - 'H100_26H100_27H100_28H100_29'
+      - 'Het-4Mix'
+  ```
+- 四种 GPU 仅提供节点内（8 卡）带宽字典，跨节点带宽沿用默认的 H100 CSV；最终通信带宽会在 H100 跨节点结果与节点内最小值之间取瓶颈，确保异构节点不会高估性能。
+- 多租户仿真、利用率/累积评估的输出会自动落在 `Data/Evaluation/Het-4Mix/` 子目录，模型权重则保存到 `model/H100_Real/Het-4Mix/`。
 
 ## 后续工作
 

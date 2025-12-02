@@ -86,6 +86,11 @@ class ClusterStateManager:
     - 通过传入带宽预测函数（bandwidth_predictor），使其能够支持不同的评估模式
     - if_real_data 是算法级别的选择，不应该硬编码在 ClusterStateManager 中
     - 使用 create_bandwidth_predictor() 工厂函数创建预测函数，确保一致性
+    - contention_mode 控制争用建模逻辑：
+        - "intensive"（默认）：跨节点任务假设满负载，按照瓶颈容量瓜分带宽
+        - "common"：模拟实时监控下的中等占用情况，任务仅以 25%~50% 峰值带宽发流，
+          以该占用量为“需求”进行争用切分
+        - "idle"：认为任务错峰运行，不发生争用，始终保持独占带宽
     
     使用示例：
         # 创建预测函数
@@ -111,15 +116,26 @@ class ClusterStateManager:
         self, 
         total_gpu: int,
         bandwidth_predictor: Callable[[np.ndarray], float],
+        contention_mode: str = "intensive",
+        occupancy_seed: Optional[int] = None,
     ):
         """初始化集群状态管理器。
         
         Args:
             total_gpu: 集群总GPU数量
             bandwidth_predictor: 带宽预测函数，接受 np.ndarray (GPU组合) 返回 float (带宽值)
+            contention_mode: 争用模式，"intensive" 表示始终考虑跨节点争用，
+                "idle" 表示不发生争用（任务维持独占带宽）
         """
+        valid_modes = {"intensive", "common", "idle"}
+        if contention_mode not in valid_modes:
+            raise ValueError(
+                f"不支持的 contention_mode '{contention_mode}'，必须为 {sorted(valid_modes)}"
+            )
+
         self.total_gpu = total_gpu
         self.bandwidth_predictor = bandwidth_predictor
+        self.contention_mode = contention_mode
 
         # 0: idle, 1: busy
         self.allocated_gpu_mask = np.zeros(total_gpu, dtype=int)
@@ -128,7 +144,8 @@ class ClusterStateManager:
         # Format: {
         #   'job_id': int, 
         #   'combo': np.array, 
-        #   'standalone_bw': float, # 独占时的理论带宽
+        #   'standalone_bw': float, # 独占时的峰值带宽
+        #   'occupancy_bw': float,  # common 模式下的实时占用带宽（否则与 standalone 相同）
         #   'current_bw': float,    # 当前考虑争用后的带宽
         #   'history': List[float]  # 带宽变化历史
         # }
@@ -136,6 +153,38 @@ class ClusterStateManager:
         
         # 节点大小（假设8卡一机）
         self.node_size = 8
+
+        # 公共模式下的占用比率控制
+        self._occupancy_seed = occupancy_seed if occupancy_seed is not None else 0
+        self._occupancy_ratio_cache: Dict[int, float] = {}
+        self._current_job_context: Optional[int] = None
+
+    def _should_apply_contention(self) -> bool:
+        """判断当前是否需要执行争用逻辑。"""
+        return self.contention_mode in {"intensive", "common"}
+
+    def _is_common_mode(self) -> bool:
+        return self.contention_mode == "common"
+
+    def _derive_effective_demand(self, standalone_bw: float, job_id: Optional[int]) -> float:
+        """
+        生成用于争用计算的“占用带宽”。
+        common 模式下随机采样 25%~50% 峰值带宽，模拟实时流量；其他模式返回峰值。
+        """
+        if self._is_common_mode():
+            if job_id is None:
+                raise ValueError(
+                    "common 模式需要提供 job_id，上层需调用 set_job_context 或显式传入 job_id"
+                )
+            ratio = self._get_or_create_occupancy_ratio(job_id)
+            return standalone_bw * ratio
+        return standalone_bw
+
+    def _get_job_demand(self, job: Dict) -> float:
+        """获取某个任务在当前模式下参与争用的需求带宽。"""
+        if self._is_common_mode():
+            return job.get("occupancy_bw", job["standalone_bw"])
+        return job["standalone_bw"]
 
     def _validate_combo_request(
         self,
@@ -182,6 +231,32 @@ class ClusterStateManager:
         """返回当前未被占用的GPU索引列表"""
         return list(np.where(self.allocated_gpu_mask == 0)[0])
 
+    def set_job_context(self, job_id: Optional[int]) -> None:
+        """为 predict_with_contention 设置当前评估的 job_id。"""
+        self._current_job_context = job_id
+
+    def clear_job_context(self) -> None:
+        """清理当前 job 上下文。"""
+        self._current_job_context = None
+
+    def _resolve_job_id(self, job_id: Optional[int]) -> Optional[int]:
+        if job_id is not None:
+            return job_id
+        return self._current_job_context
+
+    def _get_or_create_occupancy_ratio(self, job_id: int) -> float:
+        """按 job_id 生成稳定的占用比例，确保预测与提交阶段一致。"""
+        if job_id in self._occupancy_ratio_cache:
+            return self._occupancy_ratio_cache[job_id]
+        mask = (1 << 64) - 1
+        base = (int(self._occupancy_seed) if self._occupancy_seed is not None else 0) & mask
+        job_component = (int(job_id) * 0x9E3779B185EBCA87) & mask
+        seed = base ^ job_component
+        rng = np.random.default_rng(np.uint64(seed))
+        ratio = float(rng.uniform(0.25, 0.5))
+        self._occupancy_ratio_cache[job_id] = ratio
+        return ratio
+
     def _predict_combo_bandwidth(self, combo: np.ndarray) -> float:
         """基础预测函数：预测给定组合的带宽（不考虑外部争用）。
         
@@ -194,7 +269,7 @@ class ClusterStateManager:
         Returns:
             预测的带宽值
         """
-        return self.bandwidth_predictor(combo)
+        return int(self.bandwidth_predictor(combo))
 
     def _is_cross_node_combo(self, combo: np.ndarray) -> bool:
         """判断GPU组合是否跨多个节点。
@@ -324,29 +399,43 @@ class ClusterStateManager:
         # 取最小值
         return min(capacity1, capacity2)
 
-    def predict_with_contention(self, candidate_combo: np.ndarray) -> float:
+    def predict_with_contention(
+        self,
+        candidate_combo: np.ndarray,
+        job_id: Optional[int] = None,
+    ) -> float:
         """
         Probe接口：预测如果加入该候选组合，它能获得的带宽。
         实现逻辑：
         1. 判断候选组合是否跨节点。
-        2. 如果候选组合不是跨节点的，直接返回独立带宽（单节点任务不与其他任务争用）。
+        2. 如果候选组合不是跨节点的，直接返回独立带宽/占用带宽（单节点任务不与其他任务争用）。
         3. 如果候选组合是跨节点的，只考虑其他跨节点的活跃任务进行争用计算。
         4. 对于每个与候选任务有共享节点的跨节点任务，计算双向super combo容量：
            - 从候选任务视角：candidate + project(job, candidate_nodes)
            - 从已有任务视角：job + project(candidate, job_nodes)
            - 取这两个容量的最小值
         5. 最终的瓶颈容量 = 所有双向容量的最小值
-        6. 总需求 = Candidate_Standalone + 所有相关任务的完整 Standalone_BW
+        6. 总需求 = 聚合后的候选需求 + 所有相关任务的需求带宽
+           - 在 "intensive" 模式下，需求=独占带宽
+           - 在 "common" 模式下，需求=随机采样的 25%~50% 峰值带宽
         7. 若总需求 > 瓶颈，按比例瓜分。
+        当 contention_mode="idle" 时，该函数直接返回独占带宽。
         """
         candidate_combo = self._validate_combo_request(candidate_combo, enforce_availability=True)
+        resolved_job_id = self._resolve_job_id(job_id)
 
-        # 计算候选者的独立带宽
+        # 计算候选者的独立带宽与需求带宽
         candidate_standalone = self._predict_combo_bandwidth(candidate_combo)
+        # common 模式下，candidate_demand 代表实时监控的占用带宽（25%~50% 峰值）
+        candidate_demand = self._derive_effective_demand(candidate_standalone, resolved_job_id)
+
+        if not self._should_apply_contention():
+            # idle 模式认为任务彼此错峰，不发生争用
+            return candidate_standalone
         
         # 1. 判断候选组合是否跨节点
         if not self._is_cross_node_combo(candidate_combo):
-            # 单节点任务不与其他任务争用，直接返回独立带宽
+            # 单节点任务不与其他任务争用
             return candidate_standalone
         
         # 2. 候选组合是跨节点的，需要检查与其他跨节点任务的争用
@@ -379,53 +468,62 @@ class ClusterStateManager:
                     job_combo, job_nodes
                 )
                 dual_capacities.append(dual_cap)
-                # 使用完整任务的独立带宽
-                existing_demands += job['standalone_bw']
+                # 使用任务在当前模式下的需求带宽
+                existing_demands += self._get_job_demand(job)
 
         # 4. 计算瓶颈带宽：取所有双向容量的最小值
         if not dual_capacities:
-            # 没有其他相关任务，直接返回独立带宽
+            # 没有其他相关任务
             return candidate_standalone
         
         max_capacity = min(dual_capacities)
         
         # 5. 争用判定
-        total_demand = candidate_standalone + existing_demands
+        total_demand = candidate_demand + existing_demands
         
         if total_demand <= max_capacity:
             # 未达到瓶颈
             return candidate_standalone
         else:
             # 达到瓶颈，按比例瓜分
-            # 候选者获得的比例
-            ratio = candidate_standalone / total_demand
+            ratio = candidate_demand / total_demand
             allocated_bw = max_capacity * ratio
-            return allocated_bw
+            return min(candidate_standalone, allocated_bw)
 
     def allocate_job(self, job_id: int, combo: np.ndarray) -> float:
         """
         Commit接口：正式分配GPU给任务，更新状态，并修正受影响的历史任务带宽。
         
         根据需求，只有跨节点的任务才会相互干扰。单节点任务不会影响其他任务的带宽。
+        当 contention_mode="common" 时，每个任务会在加入时随机生成 25%~50% 的占用带宽，
+        争用时以该占用值为需求量。若为 "idle" 模式，任务永远保持独占带宽。
         """
         combo = self._validate_combo_request(combo, enforce_availability=True)
 
         # 1. 注册新任务
         standalone_bw = self._predict_combo_bandwidth(combo)
+        occupancy_bw = self._derive_effective_demand(standalone_bw, job_id)  # common 模式一次性采样占用带宽
         self.allocated_gpu_mask += combo
         
         new_job = {
             'job_id': job_id,
             'combo': combo,
             'standalone_bw': standalone_bw,
-            'current_bw': standalone_bw, # 初始值，马上会更新
+            'occupancy_bw': occupancy_bw,
+            'current_bw': standalone_bw,
             'history': []
         }
         self.active_jobs.append(new_job)
         
+        if not self._should_apply_contention():
+            # idle 模式：任务永远维持独占带宽
+            for job in self.active_jobs:
+                job['history'].append(job['current_bw'])
+            return standalone_bw
+
         # 2. 判断新任务是否跨节点
         if not self._is_cross_node_combo(combo):
-            # 单节点任务不与其他任务争用，直接设置带宽为独立带宽
+            # 单节点任务不与其他任务争用
             # 不更新其他任务，记录历史后返回
             for job in self.active_jobs:
                 job['history'].append(job['current_bw'])
@@ -447,7 +545,7 @@ class ClusterStateManager:
             
         # 收集所有与新任务有共享节点的跨节点任务（包括刚加入的自己）
         # 对于每个相关任务，计算新任务与该任务的双向super combo容量
-        clashing_jobs = [] # List of (job_dict, standalone_bw)
+        clashing_jobs = []  # List of job_dict
         dual_capacities = []
         
         for job in self.active_jobs:
@@ -467,44 +565,32 @@ class ClusterStateManager:
                     job_combo, job_nodes
                 )
                 dual_capacities.append(dual_cap)
-                # 使用完整任务的独立带宽
-                clashing_jobs.append((job, job['standalone_bw']))
+                clashing_jobs.append(job)
         
         # 计算瓶颈：取所有双向容量的最小值
         if not dual_capacities:
             # 没有其他相关任务，新任务维持独立带宽
+            new_job['current_bw'] = standalone_bw
             for job in self.active_jobs:
                 job['history'].append(job['current_bw'])
             return standalone_bw
         
         max_capacity = min(dual_capacities)
-        total_demand = sum(item[1] for item in clashing_jobs)
+        total_demand = sum(self._get_job_demand(job) for job in clashing_jobs)
         
         # 更新带宽
         if total_demand > max_capacity:
             # print(f"带宽争用检测: 节点 {new_job_nodes} 需求 {total_demand:.2f} > 容量 {max_capacity:.2f}")
-            for job, job_standalone_bw in clashing_jobs:
-                ratio = job_standalone_bw / total_demand
+            for job in clashing_jobs:
+                job_demand = self._get_job_demand(job)
+                ratio = job_demand / total_demand
                 allocated_part = max_capacity * ratio
-                
-                # 核心逻辑：
-                # 如果是新任务，它的带宽就是 allocated_part
-                # 如果是旧任务，它的新带宽 = min(它之前的 current_bw, allocated_part)
-                # 这符合 "修正后的...还会与之前记录的...对比，各自选择最小的那个"
-                
-                if job['job_id'] == job_id:
-                    job['current_bw'] = allocated_part
-                else:
-                    old_bw = job['current_bw']
-                    new_bw = min(old_bw, allocated_part)
-                    if new_bw < old_bw:
-                        # print(f"Job {job['job_id']} 带宽被压缩: {old_bw:.2f} -> {new_bw:.2f}")
-                        job['current_bw'] = new_bw
-                    
+                job['current_bw'] = min(job['standalone_bw'], allocated_part)
+
         else:
-            # 如果没有瓶颈，新任务维持 standalone_bw，旧任务不受影响（维持原状）
-            # 但为了保险，新任务这里确认设为 standalone
-            self.active_jobs[-1]['current_bw'] = self.active_jobs[-1]['standalone_bw']
+            # 没有触发瓶颈，相关任务维持独占带宽
+            for job in clashing_jobs:
+                job['current_bw'] = job['standalone_bw']
 
         # 记录历史
         for job in self.active_jobs:

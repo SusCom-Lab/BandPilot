@@ -4,7 +4,9 @@
 
 ## `metrics.py`
 - `find_max_bw_for_k_gpus(k, gpu_bw_dict_list, total_gpu, switch_config, avail_gpu, data_path)`  
-  依据查表结果和可用 GPU 约束，计算当前设定下可实现的最大带宽，用作各算法对比的基准。
+  - 先基于 `gpu_bw_dict_list`（节点内 pkl）枚举每个节点不同激活数量下的最佳局部带宽；  
+  - 再结合 H100 CSV 查得的跨节点查找表，生成满足可用 GPU 约束的节点分布，逐个取“跨节点 vs. 节点内”瓶颈；  
+  - 这样既保持了 H100 数据在跨节点方面的对称性，又不会忽略 Het-4Mix 等异构节点的真实单机带宽，`max_bw` 对所有集群都在统一物理假设下比较。
 
 ## `compare.py`
 - `_load_predictor`：从权重文件加载 `BandwidthPredictor` 并切换到 eval 模式。

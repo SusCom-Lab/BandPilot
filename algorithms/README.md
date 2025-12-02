@@ -8,10 +8,12 @@
 
 ## `search.py`
 - `generate_next_combos` / `generate_add_combos`：用于递归搜索的候选生成。
+- `generate_next_combos_2gpu`：生成一次同时移除两个 GPU 的候选组合。
 - `find_best_2gpu_combo`：遍历两卡组合作为搜索起点。
 - `greedy_recursive_search`：每次移除一个 GPU，直至满足需求。
-- `tree_search_only`：单方向搜索，实现原脚本的“最大集合剔除”策略。
-- `improved_searching_algo`：综合递减与启发式路径，是主调度算法。
+- `greedy_recursive_search_2gpu`：优先一次移除两个 GPU，临近目标时回退为单 GPU。
+- `tree_search_only`：单方向搜索，实现原脚本的“最大集合剔除”策略，可通过 `enable_2gpu_path` 启用一次移除两个 GPU 的并行路径。
+- `improved_searching_algo`：综合递减、2-GPU 递减与启发式路径，是主调度算法，可通过 `enable_2gpu_path` 控制是否附加第三条路径。
 
 ## `eha.py`
 - `eha_search`：Equilibrium-driven Heuristic Algorithm，根据节点资源分布生成有限候选并使用模型/真实带宽筛选最优解。

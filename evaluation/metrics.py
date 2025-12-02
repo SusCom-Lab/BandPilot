@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import ast
 import logging
-from typing import List, Sequence, Tuple
+import itertools
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -44,84 +45,135 @@ def find_max_bw_for_k_gpus(
         return 0.0, []
 
     num_machines = total_gpu // 8
-    avail_node_counts = [0] * num_machines
-    for gpu_idx in avail_gpu:
+    if len(gpu_bw_dict_list) < num_machines:
+        raise ValueError(
+            "gpu_bw_dict_list 长度不足，"
+            f"当前需要 {num_machines} 个节点字典，实际 {len(gpu_bw_dict_list)}"
+        )
+
+    # 构建可用 GPU 的节点视角
+    avail_gpu_sorted = sorted(int(gpu) for gpu in avail_gpu)
+    avail_local_indices: List[List[int]] = [[] for _ in range(num_machines)]
+    for gpu_idx in avail_gpu_sorted:
         node_idx = gpu_idx // 8
+        local_idx = gpu_idx % 8
         if 0 <= node_idx < num_machines:
-            avail_node_counts[node_idx] += 1
-    avail_distribution = sorted([cnt for cnt in avail_node_counts if cnt > 0], reverse=True)
-
-    lookup = BandwidthLookupCache.ensure_loaded(data_path)
-
-    # 统计进度信息
-    matching_keys = [key for key in lookup.keys() if key[0] == k]
-    total_candidates = sum(len(lookup[key]) for key in matching_keys)
-    checked_count = 0
-    feasible_count = 0
-    
-    if total_candidates > 0:
-        logger.info(f"find_max_bw_for_k_gpus: 开始查找 k={k} 的最大带宽，候选配置总数: {total_candidates}")
-    else:
-        logger.warning(f"find_max_bw_for_k_gpus: 未找到 k={k} 的候选配置")
+            avail_local_indices[node_idx].append(local_idx)
+    avail_capacity = [len(local_list) for local_list in avail_local_indices]
+    if k > sum(avail_capacity):
+        logger.warning(
+            "find_max_bw_for_k_gpus: k=%s 仍大于可用 GPU 数 %s，返回 0 带宽。",
+            k,
+            sum(avail_capacity),
+        )
         return 0.0, []
 
-    max_bandwidth = 0.0
-    best_distribution: List[int] = []
-
+    lookup = BandwidthLookupCache.ensure_loaded(data_path)
+    cross_lookup: Dict[Tuple[int, int, Tuple[int, ...]], float] = {}
     for key, records in lookup.items():
-        total_active, _, distribution = key
-        # 查找表中存储的活跃 GPU 数与需求不一致时，跳过当前 key
-        if total_active != k:
-            continue
-        distribution_list = list(distribution)
-        distribution_list.sort(reverse=True)
+        max_bw = max(float(bw) for _, bw in records)
+        cross_lookup[key] = max_bw
 
-        # 若候选模式使用的节点数多于当前可用节点，同样无法满足
-        if len(distribution_list) > len(avail_distribution):
+    # 预计算每个节点在不同 GPU 数下的最佳节点内组合
+    best_intra_configs: Dict[Tuple[int, int], Tuple[float, Tuple[int, ...]]] = {}
+    for node_idx in range(num_machines):
+        local_avail = avail_local_indices[node_idx]
+        if not local_avail:
             continue
+
+        # 单 GPU 情况不会形成瓶颈，带宽视为正无穷
+        single_mask = [0] * 8
+        single_mask[local_avail[0]] = 1
+        best_intra_configs[(node_idx, 1)] = (float("inf"), tuple(single_mask))
+
+        node_dict = gpu_bw_dict_list[node_idx]
+        for gpu_cnt in range(2, len(local_avail) + 1):
+            best_bw = -1.0
+            best_mask: Optional[Tuple[int, ...]] = None
+            for combo in itertools.combinations(local_avail, gpu_cnt):
+                mask = [0] * 8
+                for local_idx in combo:
+                    mask[local_idx] = 1
+                mask_tuple = tuple(mask)
+                bw_value = float(node_dict.get(mask_tuple, 0.0))
+                if bw_value > best_bw:
+                    best_bw = bw_value
+                    best_mask = mask_tuple
+            if best_mask is not None:
+                best_intra_configs[(node_idx, gpu_cnt)] = (max(best_bw, 0.0), best_mask)
+
+    def build_config(distribution: Tuple[int, ...]) -> List[int]:
+        config = [0] * total_gpu
+        for node_idx, gpu_cnt in enumerate(distribution):
+            if gpu_cnt == 0:
+                continue
+            _, mask = best_intra_configs[(node_idx, gpu_cnt)]
+            base = node_idx * 8
+            for local_idx, flag in enumerate(mask):
+                if flag:
+                    config[base + local_idx] = 1
+        return config
+
+    suffix_capacity = [0] * (num_machines + 1)
+    for idx in range(num_machines - 1, -1, -1):
+        suffix_capacity[idx] = suffix_capacity[idx + 1] + avail_capacity[idx]
+
+    def generate_distributions(machine_idx: int, remaining: int, current: List[int]):
+        if remaining < 0:
+            return
+        if machine_idx == num_machines:
+            if remaining == 0:
+                yield tuple(current)
+            return
+        if remaining > suffix_capacity[machine_idx]:
+            return
+        max_take = min(8, avail_capacity[machine_idx], remaining)
+        for cnt in range(max_take, -1, -1):
+            if cnt > 0 and (machine_idx, cnt) not in best_intra_configs:
+                continue
+            current.append(cnt)
+            yield from generate_distributions(machine_idx + 1, remaining - cnt, current)
+            current.pop()
+
+    best_bandwidth = 0.0
+    best_config: List[int] = []
+
+    for distribution in generate_distributions(0, k, []):
+        active_counts = [cnt for cnt in distribution if cnt > 0]
+        if not active_counts:
+            continue
+        if len(active_counts) == 1:
+            cross_bw = float("inf")
+        else:
+            key = (k, len(active_counts), tuple(sorted(active_counts)))
+            cross_bw = cross_lookup.get(key, 0.0)
+            if cross_bw <= 0:
+                continue
+
+        intra_bw = float("inf")
         feasible = True
-        for idx in range(len(distribution_list)):
-            if avail_distribution[idx] < distribution_list[idx]:
+        for node_idx, gpu_cnt in enumerate(distribution):
+            if gpu_cnt == 0:
+                continue
+            intra_info = best_intra_configs.get((node_idx, gpu_cnt))
+            if intra_info is None:
                 feasible = False
                 break
-        # 节点资源不足，继续下一个候选
+            if gpu_cnt >= 2:
+                intra_bw = min(intra_bw, intra_info[0])
         if not feasible:
             continue
 
-        for mapping_str, bandwidth in records:
-            checked_count += 1
-            # 每检查 100 个候选配置显示一次进度（避免除零错误）
-            if total_candidates > 0 and checked_count % 100 == 0:
-                progress_pct = checked_count * 100 // total_candidates
-                logger.info(
-                    f"find_max_bw_for_k_gpus: 进度 {checked_count}/{total_candidates} "
-                    f"({progress_pct}%), "
-                    f"当前最大带宽: {max_bandwidth:.2f}, 可行配置数: {feasible_count}"
-                )
-            
-            bw_value = float(bandwidth)
-            # 所有通过可行性检查的配置都计入可行配置数
-            feasible_count += 1
-            if bw_value > max_bandwidth:
-                max_bandwidth = bw_value
-                best_distribution = distribution_list
-                # 找到更大的带宽值时也输出提示
-                logger.debug(
-                    f"find_max_bw_for_k_gpus: 找到更大带宽 {bw_value:.2f}, "
-                    f"节点分布: {best_distribution}"
-                )
+        candidate_bw = min(cross_bw, intra_bw)
+        if candidate_bw > best_bandwidth:
+            best_bandwidth = candidate_bw
+            best_config = build_config(distribution)
 
-    # 查找完成，输出最终结果
-    if max_bandwidth > 0:
-        logger.info(
-            f"find_max_bw_for_k_gpus: 查找完成，共检查 {checked_count} 个候选配置，"
-            f"找到 {feasible_count} 个可行配置，最大带宽: {max_bandwidth:.4f}"
-        )
-    else:
+    if best_bandwidth <= 0:
         logger.warning(
-            f"find_max_bw_for_k_gpus: 查找完成，共检查 {checked_count} 个候选配置，"
-            f"未找到可通过可用GPU实现的带宽配置"
+            "find_max_bw_for_k_gpus: 未在当前可用 GPU 条件下找到可行的 k=%s 配置", k
         )
+        return 0.0, []
 
-    return max_bandwidth, best_distribution
+    return best_bandwidth, best_config
 

@@ -63,6 +63,7 @@ def find_best_2gpu_combo(
     
     # 优先使用 cluster_manager 进行带宽评估
     if cluster_manager:
+        # 多租户场景：直接依赖集群状态管理器的实时预测，避免重复构造模型输入
         best_idx = -1
         best_bw = -1.0
         for idx, combo in enumerate(all_combos):
@@ -72,6 +73,7 @@ def find_best_2gpu_combo(
                 best_idx = idx
         return all_combos[best_idx] if best_idx >= 0 else None
     elif if_real_data:
+        # 真实数据模式：遍历所有组合并用测得的带宽排序
         best_idx = -1
         best_bw = -1
         for idx, combo in enumerate(all_combos):
@@ -83,6 +85,7 @@ def find_best_2gpu_combo(
                 best_idx = idx
         return all_combos[best_idx] if best_idx >= 0 else None
 
+    # 模型预测模式：一次性批量构造输入，减少推理次数
     part_bws, node_counts, total_counts = prepare_model_inputs(
         all_combos, total_gpu, gpu_bw_dict_list, switch_config, data_path
     )
@@ -115,6 +118,7 @@ def greedy_recursive_search(
     if ones_count == gpu_need:
         return current_combo
 
+    # 生成所有可能的单卡剔除方案
     candidate_combos = generate_next_combos(current_combo)
     
     # 修改：带宽评估逻辑，优先使用 cluster_manager
@@ -125,6 +129,7 @@ def greedy_recursive_search(
             # 全局模式：评估全局带宽（当前配置 + 剩余GPU）
             num_dimensions = len(current_combo)
             for combo in candidate_combos:
+                # 每个候选都需要结合剩余 GPU 进行全局评估
                 bw = _evaluate_global_bandwidth(
                     combo, avail_gpu, num_dimensions, cluster_manager
                 )
@@ -141,6 +146,7 @@ def greedy_recursive_search(
             )
             scores.append(bw_value)
     else:
+        # 通过一次批量推理拿到所有候选配置的带宽预测
         part_bws, node_counts, total_counts = prepare_model_inputs(
             candidate_combos, total_gpu, gpu_bw_dict_list, switch_config, data_path
         )
@@ -151,6 +157,8 @@ def greedy_recursive_search(
         elif hasattr(scores, '__iter__') and not isinstance(scores, (list, tuple)):
             scores = list(scores)
             
+    # 选出带宽得分最高的组合并继续向下递归
+    # 根据得分选择下一轮起点，继续递归逼近目标 GPU 数
     best_idx = int(np.argmax(scores))
     best_next_combo = candidate_combos[best_idx]
     
@@ -184,9 +192,10 @@ def tree_search_only(
     artifact_dir: Path,
     if_real_data: bool = False,
     cluster_manager: Optional['ClusterStateManager'] = None,
+    global_mode: bool = False,
 ) -> Optional[np.ndarray]:
     """
-    改进的搜索算法：从最大集合剔除，支持节点插入优化。
+    改进的搜索算法：从最大集合剔除，支持节点插入优化，且可选全局带宽评估。
     
     :param num_dimensions: GPU总数
     :param avail_gpu: 可用GPU列表
@@ -199,6 +208,7 @@ def tree_search_only(
     :param device: 设备
     :param artifact_dir: 模型目录
     :param if_real_data: 是否使用真实数据
+    :param global_mode: 是否基于“已选 + 剩余”计算全局带宽（需 cluster_manager）
     :return: 最优GPU组合
     """
     if len(avail_gpu) < gpu_need:
@@ -213,207 +223,87 @@ def tree_search_only(
     max_gpu_combo = generate_data_minmax_restricted(
         1, num_dimensions, min_ones=len(avail_gpu), max_ones=len(avail_gpu), avail_gpu=avail_gpu
     )[0]
-
-    # 检查是否可以使用节点插入的优化方法
-    success_insert = False
-    best_gpu = np.zeros(num_dimensions, dtype=int)
     complete_host_list = [[int(8 * i + e) for e in range(0, 8)] for i in range(0, int(num_dimensions / 8))]
     complete_node_list = [[int(4 * i + e) for e in range(0, 4)] for i in range(0, int(num_dimensions / 4))]
+    avail_set = set(avail_gpu)
 
-    if if_real_data:
-        # 检查四卡节点插入
-        if gpu_need <= 4:
-            available_nodes = []
-            for comp in complete_node_list:
-                if set(comp).issubset(set(avail_gpu)):
-                    available_nodes.append(comp)
-            if available_nodes:
-                success_insert = True
-                if len(available_nodes) > 1:
-                    max_bw = -1
-                    best_node = None
-                    for node in available_nodes:
-                        temp_gpu = np.zeros(num_dimensions, dtype=int)
-                        temp_gpu[node] = 1
-                        bw_value, _, _ = calculate_bandwidth_values(
-                            temp_gpu, total_gpu, gpu_bw_dict_list, switch_config, data_path
-                        )
-                        if bw_value > max_bw:
-                            max_bw = bw_value
-                            best_node = node
-                    best_gpu[best_node] = 1
-                else:
-                    best_gpu[available_nodes[0]] = 1
+    def _score_combo(combo: np.ndarray, use_real_data: bool) -> float:
+        """统一输出当前组合的得分，必要时启用全局带宽评估。"""
+        if global_mode and cluster_manager:
+            return _evaluate_global_bandwidth(combo, avail_gpu, num_dimensions, cluster_manager)
+        return _evaluate_bandwidth(
+            combo,
+            model,
+            total_gpu,
+            gpu_bw_dict_list,
+            switch_config,
+            data_path,
+            device,
+            artifact_dir,
+            use_real_data,
+            cluster_manager,
+        )
 
-                combo_from_subtract = greedy_recursive_search(
-                    current_combo=best_gpu,
-                    gpu_need=gpu_need,
-                    model=model,
-                    total_gpu=total_gpu,
-                    gpu_bw_dict_list=gpu_bw_dict_list,
-                    switch_config=switch_config,
-                    data_path=data_path,
-                    device=device,
-                    artifact_dir=artifact_dir,
-                    if_real_data=True,
-                    cluster_manager=cluster_manager,
-                )
-                return combo_from_subtract
+    def _run_tree_paths(start_combo: np.ndarray, use_real_data: bool) -> np.ndarray:
+        """从指定起点运行单卡剔除路径。"""
+        combo_from_subtract = greedy_recursive_search(
+            current_combo=start_combo,
+            gpu_need=gpu_need,
+            model=model,
+            total_gpu=total_gpu,
+            gpu_bw_dict_list=gpu_bw_dict_list,
+            switch_config=switch_config,
+            data_path=data_path,
+            device=device,
+            artifact_dir=artifact_dir,
+            if_real_data=use_real_data,
+            cluster_manager=cluster_manager,
+            global_mode=global_mode,
+            avail_gpu=avail_gpu,
+        )
+        return combo_from_subtract
 
-        # 检查八卡主机插入
-        if gpu_need <= 8 and not success_insert:
-            available_hosts = []
-            for comp in complete_host_list:
-                if set(comp).issubset(set(avail_gpu)):
-                    available_hosts.append(comp)
+    def _select_best_complete_group(group_list: List[List[int]]) -> Optional[np.ndarray]:
+        """从可用节点/主机中选出带宽最高的一个组合。"""
+        candidates = [group for group in group_list if set(group).issubset(avail_set)]
+        if not candidates:
+            return None
 
-            if available_hosts:
-                success_insert = True
-                if len(available_hosts) > 1:
-                    max_bw = -1
-                    best_host = None
-                    for host in available_hosts:
-                        temp_gpu = np.zeros(num_dimensions, dtype=int)
-                        temp_gpu[host] = 1
-                        bw_value, _, _ = calculate_bandwidth_values(
-                            temp_gpu, total_gpu, gpu_bw_dict_list, switch_config, data_path
-                        )
-                        if bw_value > max_bw:
-                            max_bw = bw_value
-                            best_host = host
-                    best_gpu[best_host] = 1
-                else:
-                    best_gpu[available_hosts[0]] = 1
+        chosen_group = candidates[0]
+        if len(candidates) > 1:
+            best_bw = float('-inf')
+            for group in candidates:
+                temp_combo = np.zeros(num_dimensions, dtype=int)
+                temp_combo[group] = 1
+                bw = _score_combo(temp_combo, use_real_data=True)
+                if bw > best_bw:
+                    best_bw = bw
+                    chosen_group = group
 
-                combo_from_subtract = greedy_recursive_search(
-                    current_combo=best_gpu,
-                    gpu_need=gpu_need,
-                    model=model,
-                    total_gpu=total_gpu,
-                    gpu_bw_dict_list=gpu_bw_dict_list,
-                    switch_config=switch_config,
-                    data_path=data_path,
-                    device=device,
-                    artifact_dir=artifact_dir,
-                    if_real_data=True,
-                    cluster_manager=cluster_manager,
-                )
-                return combo_from_subtract
+        combo = np.zeros(num_dimensions, dtype=int)
+        combo[chosen_group] = 1
+        return combo
 
-        # 如果没有成功使用节点插入，使用原始的方法
-        if not success_insert:
-            combo_from_subtract = greedy_recursive_search(
-                current_combo=max_gpu_combo,
-                gpu_need=gpu_need,
-                model=model,
-                total_gpu=total_gpu,
-                gpu_bw_dict_list=gpu_bw_dict_list,
-                switch_config=switch_config,
-                data_path=data_path,
-                device=device,
-                artifact_dir=artifact_dir,
-                if_real_data=True,
-                cluster_manager=cluster_manager,
-            )
-            return combo_from_subtract
-    else:
-        if gpu_need <= 4:
-            # 检查四卡节点插入
-            available_nodes = []
-            for comp in complete_node_list:
-                if set(comp).issubset(set(avail_gpu)):
-                    available_nodes.append(comp)
-            if available_nodes:
-                success_insert = True
-                if len(available_nodes) > 1:
-                    max_bw = -1
-                    best_node = None
-                    for node in available_nodes:
-                        temp_gpu = np.zeros(num_dimensions, dtype=int)
-                        temp_gpu[node] = 1
-                        bw_value, _, _ = calculate_bandwidth_values(
-                            temp_gpu, total_gpu, gpu_bw_dict_list, switch_config, data_path
-                        )
-                        if bw_value > max_bw:
-                            max_bw = bw_value
-                            best_node = node
-                    best_gpu[best_node] = 1
-                else:
-                    best_gpu[available_nodes[0]] = 1
+    def _attempt_insert(group_list: List[List[int]], limit: int) -> Optional[np.ndarray]:
+        """若所需 GPU 在 limit 内，尝试整节点/整机插入并直接运行树搜索。"""
+        if gpu_need > limit:
+            return None
+        start_combo = _select_best_complete_group(group_list)
+        if start_combo is None:
+            return None
+        # 历史逻辑：插入后统一按真实数据路径评估，以保证带宽排序一致
+        return _run_tree_paths(start_combo, use_real_data=True)
 
-                combo_from_subtract = greedy_recursive_search(
-                    current_combo=best_gpu,
-                    gpu_need=gpu_need,
-                    model=model,
-                    total_gpu=total_gpu,
-                    gpu_bw_dict_list=gpu_bw_dict_list,
-                    switch_config=switch_config,
-                    data_path=data_path,
-                    device=device,
-                    artifact_dir=artifact_dir,
-                    if_real_data=True,
-                    cluster_manager=cluster_manager,
-                )
-                return combo_from_subtract
+    # 先尝试四卡节点，再尝试八卡主机，均失败时退回最大集合
+    node_result = _attempt_insert(complete_node_list, limit=4)
+    if node_result is not None:
+        return node_result
 
-        # 检查八卡主机插入
-        if gpu_need <= 8 and not success_insert:
-            available_hosts = []
-            for comp in complete_host_list:
-                if set(comp).issubset(set(avail_gpu)):
-                    available_hosts.append(comp)
+    host_result = _attempt_insert(complete_host_list, limit=8)
+    if host_result is not None:
+        return host_result
 
-            if available_hosts:
-                success_insert = True
-                if len(available_hosts) > 1:
-                    max_bw = -1
-                    best_host = None
-                    for host in available_hosts:
-                        temp_gpu = np.zeros(num_dimensions, dtype=int)
-                        temp_gpu[host] = 1
-                        bw_value, _, _ = calculate_bandwidth_values(
-                            temp_gpu, total_gpu, gpu_bw_dict_list, switch_config, data_path
-                        )
-                        if bw_value > max_bw:
-                            max_bw = bw_value
-                            best_host = host
-                    best_gpu[best_host] = 1
-                else:
-                    best_gpu[available_hosts[0]] = 1
-
-                combo_from_subtract = greedy_recursive_search(
-                    current_combo=best_gpu,
-                    gpu_need=gpu_need,
-                    model=model,
-                    total_gpu=total_gpu,
-                    gpu_bw_dict_list=gpu_bw_dict_list,
-                    switch_config=switch_config,
-                    data_path=data_path,
-                    device=device,
-                    artifact_dir=artifact_dir,
-                    if_real_data=True,
-                    cluster_manager=cluster_manager,
-                )
-                return combo_from_subtract
-
-        # 如果没有成功使用节点插入，使用原始的方法
-        if not success_insert:
-            combo_from_subtract = greedy_recursive_search(
-                current_combo=max_gpu_combo,
-                gpu_need=gpu_need,
-                model=model,
-                total_gpu=total_gpu,
-                gpu_bw_dict_list=gpu_bw_dict_list,
-                switch_config=switch_config,
-                data_path=data_path,
-                device=device,
-                artifact_dir=artifact_dir,
-                if_real_data=if_real_data,
-                cluster_manager=cluster_manager,
-            )
-            return combo_from_subtract
-
-    return None
+    return _run_tree_paths(max_gpu_combo, use_real_data=if_real_data)
 
 
 def _try_node_insert_optimization(
@@ -445,6 +335,7 @@ def _try_node_insert_optimization(
     
     # 检查四卡节点插入
     if gpu_need <= 4:
+        # 收集所有完全可用的 4 卡节点
         available_nodes = []
         for comp in complete_node_list:
             if set(comp).issubset(set(avail_gpu)):
@@ -486,6 +377,7 @@ def _try_node_insert_optimization(
     
     # 检查八卡主机插入
     if gpu_need <= 8 and not success_insert:
+        # 收集所有完全可用的 8 卡整机
         available_hosts = []
         for comp in complete_host_list:
             if set(comp).issubset(set(avail_gpu)):
@@ -547,13 +439,16 @@ def _evaluate_bandwidth(
     :return: 带宽值
     """
     if cluster_manager:
+        # 首选在线预测，保证与调度器的一致性
         return cluster_manager.predict_with_contention(combo)
     elif if_real_data:
+        # 真实数据路径：直接查表/插值得到带宽
         bw_value, _, _ = calculate_bandwidth_values(
             combo, total_gpu, gpu_bw_dict_list, switch_config, data_path
         )
         return bw_value
     else:
+        # 模型推理路径：单条配置也复用 prepare_model_inputs，避免重复代码
         part_bws_list, node_counts_list, total_counts_list = prepare_model_inputs(
             np.array([combo]), total_gpu, gpu_bw_dict_list, switch_config, data_path
         )
@@ -581,7 +476,7 @@ def _evaluate_global_bandwidth(
     :param cluster_manager: 集群状态管理器
     :return: 全局带宽值（当前配置带宽 + 剩余GPU带宽）
     """
-    # 评估当前配置的带宽
+    # 评估当前配置的带宽，反映已分配训练任务的收益
     current_bw = cluster_manager.predict_with_contention(config)
     
     # 计算剩余可用GPU（avail_gpu 中不在 config 中的 GPU）
@@ -632,64 +527,62 @@ def _compare_and_select_best(
     :return: 最优GPU组合
     """
     # 处理 None 情况
-    if combo_from_subtract is None:
-        logger.warning("combo_from_subtract 为 None，使用 EHA 结果")
-        return combo_from_eha
-    
-    if combo_from_eha is None:
-        logger.warning("combo_from_eha 为 None，使用 subtract 结果")
-        return combo_from_subtract
-    
-    # 评估带宽
+    candidates: List[Tuple[str, np.ndarray]] = []
+    if combo_from_eha is not None:
+        candidates.append(("eha", combo_from_eha))
+    if combo_from_subtract is not None:
+        candidates.append(("subtract", combo_from_subtract))
+
+    if not candidates:
+        logger.warning("所有候选结果均为 None")
+        return None
+
+    if len(candidates) == 1:
+        logger.warning("只有一个候选结果，直接返回")
+        return candidates[0][1]
+
     if cluster_manager:
+        # 多租户模式下直接重用在线带宽评估
         if global_mode and avail_gpu is not None and num_dimensions is not None:
-            # 全局模式：评估全局带宽（当前配置 + 剩余GPU）
-            bw_subtract = _evaluate_global_bandwidth(
-                combo_from_subtract, avail_gpu, num_dimensions, cluster_manager
-            )
-            bw_eha = _evaluate_global_bandwidth(
-                combo_from_eha, avail_gpu, num_dimensions, cluster_manager
-            )
+            bw_list = [
+                _evaluate_global_bandwidth(combo, avail_gpu, num_dimensions, cluster_manager)
+                for _, combo in candidates
+            ]
         else:
-            # 普通模式：只评估当前配置
-            bw_subtract = cluster_manager.predict_with_contention(combo_from_subtract)
-            bw_eha = cluster_manager.predict_with_contention(combo_from_eha)
+            bw_list = [cluster_manager.predict_with_contention(combo) for _, combo in candidates]
     elif if_real_data:
-        bw_subtract, _, _ = calculate_bandwidth_values(
-            combo_from_subtract, total_gpu, gpu_bw_dict_list, switch_config, data_path
-        )
-        bw_eha, _, _ = calculate_bandwidth_values(
-            combo_from_eha, total_gpu, gpu_bw_dict_list, switch_config, data_path
-        )
+        bw_list = [
+            calculate_bandwidth_values(combo, total_gpu, gpu_bw_dict_list, switch_config, data_path)[0]
+            for _, combo in candidates
+        ]
     else:
-        # 使用模型预测
-        part_bws_list_subtract, node_counts_list_subtract, total_counts_list_subtract = prepare_model_inputs(
-            np.array([combo_from_subtract]), total_gpu, gpu_bw_dict_list, switch_config, data_path
+        combo_array = np.array([combo for _, combo in candidates])
+        part_bws_list, node_counts_list, total_counts_list = prepare_model_inputs(
+            combo_array, total_gpu, gpu_bw_dict_list, switch_config, data_path
         )
-        part_bws_list_eha, node_counts_list_eha, total_counts_list_eha = prepare_model_inputs(
-            np.array([combo_from_eha]), total_gpu, gpu_bw_dict_list, switch_config, data_path
+        bw_pred = predict_with_model(
+            model, part_bws_list, node_counts_list, total_counts_list, device, artifact_dir
         )
-        
-        bw_subtract = predict_with_model(
-            model, part_bws_list_subtract, node_counts_list_subtract, total_counts_list_subtract, device, artifact_dir
-        )[0]
-        bw_eha = predict_with_model(
-            model, part_bws_list_eha, node_counts_list_eha, total_counts_list_eha, device, artifact_dir
-        )[0]
-        
-        # else分支的特殊处理：如果使用了节点插入，subtract结果使用真实数据评估
+        if hasattr(bw_pred, 'tolist'):
+            bw_list = bw_pred.tolist()
+        elif hasattr(bw_pred, '__iter__') and not isinstance(bw_pred, (list, tuple)):
+            bw_list = list(bw_pred)
+        else:
+            bw_list = bw_pred
+
         if success_insert:
-            bw_subtract, _, _ = calculate_bandwidth_values(
-                combo_from_subtract, total_gpu, gpu_bw_dict_list, switch_config, data_path
-            )
-    
-    # 选择带宽最大的组合
-    bw_list = [bw_subtract, bw_eha]
-    combo_list = [combo_from_subtract, combo_from_eha]
+            # 若经历了节点插入优化，需要用真实带宽修正 subtract 路径的得分
+            for idx, (label, combo) in enumerate(candidates):
+                if label == "subtract":
+                    bw_list[idx], _, _ = calculate_bandwidth_values(
+                        combo, total_gpu, gpu_bw_dict_list, switch_config, data_path
+                    )
+                    break
+
     max_idx = int(np.argmax(bw_list))
     if not if_real_data:
-        logger.info(f"预测的最优带宽为：{np.max(bw_list)},选择的算法是：{np.argmax(bw_list)}")
-    return combo_list[max_idx]
+        logger.info(f"预测的最优带宽为：{bw_list[max_idx]},选择的算法是：{candidates[max_idx][0]}")
+    return candidates[max_idx][1]
 
 
 def improved_searching_algo(
@@ -705,7 +598,7 @@ def improved_searching_algo(
     artifact_dir: Path,
     if_real_data: bool = False,
     cluster_manager: Optional['ClusterStateManager'] = None,
-    global_mode: bool = True,
+    global_mode: bool = False,
 ) -> Optional[np.ndarray]:
     """
     改进的搜索算法：支持多租户感知的带宽预测。
@@ -733,7 +626,6 @@ def improved_searching_algo(
         return generate_data_minmax_restricted(
             1, num_dimensions, min_ones=len(avail_gpu), max_ones=len(avail_gpu), avail_gpu=avail_gpu
         )[0]
-
     # 第一条路径：原有的从全部可用GPU开始剔除的方法
     max_gpu_combo = generate_data_minmax_restricted(
         1, num_dimensions, min_ones=len(avail_gpu), max_ones=len(avail_gpu), avail_gpu=avail_gpu
@@ -743,7 +635,7 @@ def improved_searching_algo(
     complete_host_list = [[int(8 * i + e) for e in range(0, 8)] for i in range(0, int(num_dimensions / 8))]
     complete_node_list = [[int(4 * i + e) for e in range(0, 4)] for i in range(0, int(num_dimensions / 4))]
 
-    # 尝试节点插入优化
+    # 尝试节点插入优化：若存在整节点/整机可用，直接以其为起点显著减少搜索空间
     success_insert, combo_from_subtract = _try_node_insert_optimization(
         gpu_need=gpu_need,
         num_dimensions=num_dimensions,

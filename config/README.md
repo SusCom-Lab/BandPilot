@@ -23,6 +23,9 @@ training:
 cluster:
   total_gpu              # 集群 GPU 总数（需为 8 的倍数）
   cluster_types          # 列表，可配置多个不同的拓扑组合
+                         # 例如 ['H100_26H100_27H100_28H100_29', 'Het-4Mix']
+                         # 其中 Het-4Mix 表示 4090/A800/A6000/V100 四台 8 卡服务器，
+                         # 跨节点带宽取 H100 CSV，最终带宽按节点内/跨节点瓶颈取最小值
   bw_switch              # 交换机带宽类型（同步传入评估文件名）
 
 evaluation:

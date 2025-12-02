@@ -68,8 +68,7 @@ def predict_with_model(
         preds_multi = y_scaler.inverse_transform(outputs.reshape(-1, 1)).flatten()
 
         for idx, pred in zip(multi_indices, preds_multi):
-            preds[idx] = pred
-
+            preds[idx] = round(pred,0)
     return preds
 
 

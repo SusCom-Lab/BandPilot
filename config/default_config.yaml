@@ -20,9 +20,9 @@ training:
   num_epochs: 300
   learning_rate: 0.001
   weight_decay: 0.00001
-  patience: 50
+  patience: 80
   lambda_ewc: 2.0
-  num_train_samples: 2000
+  num_train_samples: 500
   num_test_samples: 1000
 
 # 集群配置
@@ -30,13 +30,14 @@ cluster:
   total_gpu: 32
   cluster_types:
     - 'H100_26H100_27H100_28H100_29'
-  bw_switch: 20
+    - 'Het-4Mix'
+  bw_switch: 1111  #只是用于标识文件名而已
 
 # 评估配置（仅当 model.type = 'full' 时才会执行 compare.py 中的对比逻辑）
 evaluation:
   enable_utilization: false   # true: 生成 Part_mean_* (带宽占比)
   enable_accumulation: false  # true: 生成 Part_sum_* (与最优差距)
-  enable_multi_tenant: true # true: 运行多租户仿真，生成 multi_tenant_simulation.csv
+  enable_multi_tenant: True # true: 运行多租户仿真，生成 multi_tenant_simulation.csv
   repeat_num: 50              # 每个 test_num 的采样次数
   if_dynamic: true            # true 表示可用 GPU 数量随机波动，false 表示所有 GPU 可用
   
@@ -44,10 +45,14 @@ evaluation:
   multi_tenant:
     workload_mode: 'fixed_sum'  # 'fixed_sum': 生成总和为 total_gpu_sum 的随机序列; 'random': 随机生成 num_jobs 个任务
     total_gpu_sum: 32           # fixed_sum 模式下的总GPU数
-    num_jobs: 10                # random 模式下的任务数量
+    num_jobs: 100                # random 模式下的任务数量
     job_sizes: [2, 4, 6, 10, 12, 14]     # 允许的任务大小列表
-    repeat_num: 100            # 重复仿真次数
+    repeat_num: 
+      - 100       # 重复仿真次数
+    contention_mode: 
+      - 'common' # 'intensive': 满载争用, 'common': 中等随机占用, 'idle': 不争用
 
 # 其他
-random_seed: 456
+random_seed: 
+  - 1111 #1111
 device: 'cuda'

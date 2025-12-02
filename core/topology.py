@@ -117,23 +117,38 @@ def calculate_connectivity_score(gpu_indices: Sequence[int], topo_matrix: pd.Dat
 
 def convert_cluster_type_to_node_configs(cluster_type: str, gpu_num: int) -> List[Tuple[str, int]]:
     """根据cluster_type生成节点配置。"""
-    gpu_models = ["4090", "V100", "A6000", "A800", "H100_26", "H100_27", "H100_28", "H100_29"]
-    extracted = [model for model in gpu_models if model in cluster_type]
-
+    # 导入自定义集群类型配置
+    from core.bandwidth import CUSTOM_CLUSTER_NODE_TYPES
+    
     node_configs: List[Tuple[str, int]] = []
-    if "H100_26" in extracted:
-        node_configs = [("Data/H100_Real/H100_topo.txt", 8) for _ in extracted]
+    
+    # 检查是否是自定义集群类型（如 Het-4Mix）
+    if cluster_type in CUSTOM_CLUSTER_NODE_TYPES:
+        node_types = CUSTOM_CLUSTER_NODE_TYPES[cluster_type]
+        for model in node_types:
+            node_configs.append((f"Data/Topology/{model}_topo.txt", 8))
     else:
-        for model in extracted:
-            node_configs.append((f"data/{model}_topo.txt", 8))
+        # 原有的逻辑：从 cluster_type 字符串中提取 GPU 模型
+        gpu_models = ["4090", "V100", "A6000", "A800", "H100_26", "H100_27", "H100_28", "H100_29"]
+        extracted = [model for model in gpu_models if model in cluster_type]
 
-    total = sum(count for _, count in node_configs)
-    idx = 0
-    while total < gpu_num and extracted:
-        model = extracted[idx % len(extracted)]
-        node_configs.append((f"data/{model}_topo.txt", 8))
-        total += 8
-        idx += 1
+        if "H100_26" in extracted:
+            node_configs = [("Data/H100_Real/H100_topo.txt", 8) for _ in extracted]
+        else:
+            for model in extracted:
+                node_configs.append((f"Data/Topology/{model}_topo.txt", 8))
+
+        # 如果节点数不足，循环添加
+        total = sum(count for _, count in node_configs)
+        idx = 0
+        while total < gpu_num and extracted:
+            model = extracted[idx % len(extracted)]
+            if "H100_26" in extracted:
+                node_configs.append(("Data/H100_Real/H100_topo.txt", 8))
+            else:
+                node_configs.append((f"Data/Topology/{model}_topo.txt", 8))
+            total += 8
+            idx += 1
 
     return node_configs
 
