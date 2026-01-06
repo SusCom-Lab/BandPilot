@@ -77,16 +77,6 @@ python main.py --config config/default_config.yaml
 
 The default config in `config/default_config.yaml` sets data paths, model structure, training hyperparameters, and cluster/bandwidth parameters. Adjust as needed.
 
-## Main Modules
-
-- `core.bandwidth`: Bandwidth lookup cache, switch bandwidth configuration, and model input construction.
-- `core.topology`: Topology matrix parsing, composite matrix stitching, and node mapping.
-- `core.cluster_state`: `ClusterStateManager` and bandwidth modeling for contention modes (`intensive/common/idle`).
-- `models.bandwidth_predictor`: Transformer-based main model (with EWC support).
-- `data_process.preprocessing/dataset/dataloader`: Data preprocessing, sample generation, normalization, and grouped `DataLoader`.
-- `algorithms.*`: BandPilot search (`improved_searching_algo`), tree search (`tree_search_only`), EHA, Slurm BestFit, baseline/random strategies.
-- `training.trainer` / `training.evaluator`: Unified training loops, evaluation, and inference tools.
-- `evaluation.metrics` / `evaluation.compare`: Bandwidth upper-bound estimation, single-contention experiments, and offline `max_bw` cache.
 
 ## Training Config
 
@@ -127,7 +117,6 @@ In `max_bw_offline` you can further control search accuracy and budget:
 The main program first collects upper bounds via `max_bw_offline`, then (if `enable_single_contention = true`) reads the cache and runs single-contention experiments, outputting  
 `Data/Evaluation/{cluster_type}/Single_contention_*.csv`.
 
-> The current repo only provides the `model.type = 'full'` (`BandwidthPredictor`) training and evaluation path.
 
 ### Sequential execution for multiple configs (single_contention / max_bw_offline)
 
@@ -161,7 +150,7 @@ The main program first collects upper bounds via `max_bw_offline`, then (if `ena
 This repository is designed so that the main experiments in the paper can be reproduced via configuration files under `config/`.
 At a high level, the workflow is:
 
-1. **Prepare data and models** (see the section “Data and Models” below).
+1. **Prepare data and models** 
 2. **Select the target cluster type and experiment settings** in a YAML config under `config/` (e.g., cluster topology, contention modes, training hyperparameters).
 3. **Run the pipeline**:
 
@@ -176,25 +165,6 @@ At a high level, the workflow is:
 Depending on your exact config, these CSVs correspond to the tables and figures reported in the paper (e.g., main comparison on H100, ablation on search budget, Het-4Mix experiments).
 You can create additional YAML configs (e.g., variants of `default_config.yaml`) to mirror specific experimental settings described in the paper.
 
-## Data and Models
-
-To stay compatible with the original script, the following directories are required:
-
-- `Data/`: Bandwidth CSVs, topology files, bandwidth dictionaries, etc.
-- `model/`: Model weights and scaler artifacts per cluster type.
-
-Typical usage patterns:
-
-- For **training from scratch**:
-  - Populate `Data/` with the bandwidth and topology files for your cluster.
-  - Set `training.enable_training: true` in the config.
-  - After training, the model and scalers are saved under `model/{cluster_type}/`.
-
-- For **evaluation only** (using a pretrained model):
-  - Ensure `model/{cluster_type}/bandwidth_predictor_ns{num_train_samples}.pth` and corresponding scaler artifacts exist.
-  - Set `training.enable_training: false` in the config to skip training and load existing weights.
-
-If you plan to release public datasets or pretrained weights, we recommend adding download links here (e.g., institutional server, cloud storage) and instructions on where to place them inside `Data/` and `model/`.
 
 ## Het-4Mix Cluster
 
