@@ -8,7 +8,7 @@ data:
   model_save_dir: './model'
   evaluation_dir: './Data/Evaluation/'
 
-# Model parameters (set type to 'full' to enable BandwidthPredictor for utilization/cumulative evaluation)
+# Model parameters
 model:
   type: 'full'
   hidden_dim: 32
@@ -27,7 +27,7 @@ training:
   patience: 80
   lambda_ewc: 2.0
   num_train_samples: 250
-  num_test_samples: 1000
+  num_test_samples: 2500
 
 # Cluster configuration
 cluster:
@@ -37,7 +37,7 @@ cluster:
     - 'Het-4Mix'
   bw_switch: 1111  # only used as a filename tag
 
-# Evaluation configuration (compare.py logic runs only when model.type = 'full')
+# Evaluation configuration
 evaluation:
   enable_single_contention: true  # true: run single_dispatch_with_contention experiments
   single_contention:          #---------------------

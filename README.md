@@ -9,10 +9,10 @@ Please adapt the paper information and BibTeX below to your final publication de
 
 This codebase accompanies the paper:
 
-> **[Full Paper Title Here]**  
-> [Author 1], [Author 2], [Author 3], ...  
-> IEEE Transactions on Parallel and Distributed Systems (TPDS), 20XX.  
-> [Paper link](https://arxiv.org/abs/XXXX.XXXXX)  <!-- TODO: replace with the actual link -->
+> **[BandPilot: Towards Performance- and Contention-Aware GPU Dispatching in AI Clusters]**  
+> Kunming Zhang, Hanlong Liao, Junyu Xue, Deke Guo, and Guoming Tang
+> xxxxx , 20XX.  
+> [Paper link](https://arxiv.org/abs/XXXX.XXXXX) 
 
 ### Citation
 
