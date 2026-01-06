@@ -1,4 +1,4 @@
-"""带宽预测主模型。"""
+"""Main bandwidth prediction model."""
 from __future__ import annotations
 
 from typing import Dict
@@ -11,7 +11,7 @@ from models.layers import AttentionPooling, PositionalEncoding
 
 
 class BandwidthPredictor(nn.Module):
-    """Transformer + 注意力池化的带宽预测模型。"""
+    """Transformer-based bandwidth predictor with attention pooling."""
 
     def __init__(
         self,
@@ -78,11 +78,11 @@ class BandwidthPredictor(nn.Module):
         return {"final_bandwidth": final_bandwidth}
 
     def save_old_params(self) -> None:
-        """保存当前参数供EWC使用。"""
+        """Save current parameters for EWC."""
         self.old_params = {name: param.data.clone() for name, param in self.named_parameters()}
 
     def update_fisher(self, data_loader, device: torch.device) -> None:
-        """估计Fisher对角近似。"""
+        """Estimate diagonal approximation of Fisher information."""
         fisher = {name: torch.zeros_like(param) for name, param in self.named_parameters()}
         total_samples = 0
 
@@ -111,7 +111,7 @@ class BandwidthPredictor(nn.Module):
         self.fisher_diag = fisher
 
     def ewc_loss(self, lambda_ewc: float = 1.0) -> torch.Tensor:
-        """Elastic Weight Consolidation 约束。"""
+        """Elastic Weight Consolidation regularization term."""
         if self.old_params is None or self.fisher_diag is None:
             return torch.tensor(0.0, device=next(self.parameters()).device)
 

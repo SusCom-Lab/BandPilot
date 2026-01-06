@@ -1,47 +1,51 @@
-# algorithms 模块说明
+# algorithms Module Guide
 
-实现 GPU 组合搜索、启发式与基线算法，供训练/评估时调用。
+Implements GPU-combination search, heuristics, and baselines for training/evaluation.
 
 ## `baseline.py`
-- `default_algo(total_gpu, avail_gpu, gpu_need)`：根据节点/主机结构逐级尝试（完整节点→完整主机→跨节点→随机）。
-- `random_algo(total_gpu, avail_gpu, gpu_need)`：在可用 GPU 中随机抽取指定数量。
+- `default_algo(total_gpu, avail_gpu, gpu_need)`: Tiered attempts by node/host structure (full node → full host → cross-node → random).
+- `random_algo(total_gpu, avail_gpu, gpu_need)`: Randomly samples the required number of GPUs from available GPUs.
 
 ## `search.py`
-- `generate_next_combos` / `generate_add_combos`：用于递归搜索的候选生成。
-- `generate_next_combos_2gpu`：生成一次同时移除两个 GPU 的候选组合。
-- `find_best_2gpu_combo`：遍历两卡组合作为搜索起点。
-- `greedy_recursive_search`：每次移除一个 GPU，直至满足需求。
-- `greedy_recursive_search_2gpu`：优先一次移除两个 GPU，临近目标时回退为单 GPU。
-- `tree_search_only`：单方向搜索，实现原脚本的“最大集合剔除”策略，可通过 `enable_2gpu_path` 启用一次移除两个 GPU 的并行路径。
-- `improved_searching_algo`：综合递减、2-GPU 递减与启发式路径，是主调度算法，可通过 `enable_2gpu_path` 控制是否附加第三条路径。
+- `generate_next_combos`: Given a 0/1 combo, generate all candidates by removing one GPU.
+- `greedy_recursive_search`: Starting from an initial combo, recursively remove one GPU until meeting `gpu_need`.
+- `_try_node_insert_optimization`: When full 4-GPU nodes/8-GPU hosts exist, start from whole nodes/hosts to shrink the search space.
+- `_evaluate_bandwidth` / `_evaluate_global_bandwidth`: Unified bandwidth scoring via model prediction, real lookup, or `ClusterStateManager` contention-aware prediction.
+- `_compare_and_select_best`: Compare multiple paths (e.g., “largest-set removal” and EHA candidates) and pick the higher-bandwidth combo.
+- `tree_search_only`: One-direction “largest-set removal” searcher; can enable global bandwidth evaluation (`global_mode`).
+- `improved_searching_algo`: Main scheduler combining node insertion optimization, decremental search, and EHA candidates, with support for:
+  - `cluster_manager`: Uses `predict_with_contention` for bandwidth under background jobs/contention.
+  - `global_mode`: Scores “current combo + remaining GPUs” as total gain.
+  - `global_mode_all`: When `global_mode=True`, also adds bandwidth of already allocated combos to the global score.
 
 ## `eha.py`
-- `eha_search`：Equilibrium-driven Heuristic Algorithm，根据节点资源分布生成有限候选并使用模型/真实带宽筛选最优解。
+- `eha_search`: Equilibrium-driven Heuristic Algorithm; generates limited candidates per node distribution and filters with model/real bandwidth.
 
 ## `slurm.py`
-- `slurm_best_fit_algo`：模仿 Slurm 的 best-fit 策略，优先单节点，再跨节点贪心。
-- `k_clique_bandwidth_sampling_search`（可扩展）：示例性的带权采样搜索流程。
+- `slurm_best_fit_algo`: Slurm-style best-fit; prefer single-node, then cross-node greedy.
+- `k_clique_bandwidth_sampling_search` (extensible): Example weighted-sampling search flow.
 
-## 架构设计说明
+## Design Notes
 
-### if_real_data 参数的使用
+### Use of if_real_data
 
-`if_real_data` 是算法级别的参数，用于决定使用真实数据还是模型预测来计算带宽。
+`if_real_data` is an algorithm-level flag to choose real data vs. model prediction for bandwidth.
 
-**重要原则**：
-- `if_real_data` 是算法绑定的，不应该硬编码在 `ClusterStateManager` 中
-- 当使用 `cluster_manager` 时，算法的 `if_real_data` 参数应该与创建 `cluster_manager` 时使用的 `if_real_data` 一致
-- `ClusterStateManager` 通过 `create_bandwidth_predictor()` 工厂函数接收预测函数，保持通用性
+**Principles**:
+- `if_real_data` lives at the algorithm layer and should not be hardcoded inside `ClusterStateManager`.
+- When using `cluster_manager`, build the bandwidth predictor via `create_bandwidth_predictor()` first, then inject it.
+- If `cluster_manager` is provided, prefer `cluster_manager.predict_with_contention()` to stay aligned with online contention logic.
 
-**使用模式**：
-1. **不使用 cluster_manager**：算法根据 `if_real_data` 参数直接使用真实数据或模型预测
-2. **使用 cluster_manager**：
-   - 创建 `cluster_manager` 时，使用 `create_bandwidth_predictor()` 根据 `if_real_data` 创建预测函数
-   - 算法传入 `cluster_manager` 参数，并保持 `if_real_data` 参数与创建 `cluster_manager` 时一致
-   - 算法优先使用 `cluster_manager.predict_with_contention()` 进行带宽评估（考虑多租户争用）
+**Usage patterns**:
+1. **Without `cluster_manager`**:  
+   `improved_searching_algo` / `tree_search_only` switch between real lookup (`calculate_bandwidth_values`) and model prediction (`predict_with_model`) based on `if_real_data`.
+2. **With `cluster_manager` (background jobs/contention)**:  
+   - When creating `cluster_manager`, specify real vs. model via `create_bandwidth_predictor()`.  
+   - Algorithms receiving `cluster_manager` call `predict_with_contention` for candidate evaluation.  
+   - Under `global_mode`, they also incorporate “remaining GPUs” and historical task bandwidth into the global score.
 
-## 使用建议
-- 训练过程中（预测模型打分）使用 `predict_with_model`，评估真实数据则设 `if_real_data=True`。
-- 启用 `evaluation.compare` 时会自动加载主模型并调用 `improved_searching_algo`、`tree_search_only`、`eha_search`、`slurm_best_fit_algo` 等进行对比。
-- 多租户场景下，使用 `cluster_manager` 参数传入 `ClusterStateManager` 实例，算法会自动考虑资源争用。
+## Recommendations
+- For training and most evaluations, prefer model scoring via `predict_with_model`; set `if_real_data=True` when upper-bound estimates must align with real data.
+- When `evaluation.compare` collects offline max_bw or `get_single_dispatch_with_contention_data` runs, the main model loads automatically and compares `improved_searching_algo`, `tree_search_only`, `eha_search`, `slurm_best_fit_algo`, `default_algo`, `random_algo`, etc.
+- In experiments with background tasks/contention (e.g., single contention), pass `cluster_manager` (a `ClusterStateManager` instance) so algorithms account for contention and `contention_mode` occupancy modeling.
 

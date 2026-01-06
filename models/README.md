@@ -1,23 +1,23 @@
-# models 模块说明
+# models Module Guide
 
-封装所有神经网络模型及基础层，当前包含 Transformer 主模型与简化版两套实现。
+Contains all neural network models and base layers; currently includes the Transformer main model and a simplified version.
 
 ## `layers.py`
-- `PositionalEncoding`：标准正弦/余弦位置编码，支持最多 100 个序列元素。
-- `AttentionPooling`：对 Transformer 输出进行加权聚合，生成固定长度向量。
+- `PositionalEncoding`: Standard sinusoidal positional encoding, supports up to 100 sequence elements.
+- `AttentionPooling`: Weighted aggregation over Transformer outputs to produce a fixed-length vector.
 
 ## `bandwidth_predictor.py`
-- `BandwidthPredictor`：
-  - 输入：`x_bw`（part 带宽序列）、`x_node_counts`（对应节点活跃 GPU 数）、`x_total_counts`（总活跃数）。
-  - 将带宽与节点计数拼接后投影到 Transformer 编码器，再用 `AttentionPooling` + MLP 预测。
-  - 内置 EWC（Elastic Weight Consolidation）支持：`save_old_params()`、`update_fisher()`、`ewc_loss()`。
+- `BandwidthPredictor`:
+  - Inputs: `x_bw` (part bandwidth sequence), `x_node_counts` (active GPU count per node), `x_total_counts` (total active GPUs).
+  - Concatenates bandwidth and node counts, projects into a Transformer encoder, then uses `AttentionPooling` + MLP to predict bandwidth.
+  - Built-in EWC (Elastic Weight Consolidation) support: `save_old_params()`, `update_fisher()`, `ewc_loss()`.
 
 ## `simple_predictor.py`
-- `SimpleBandwidthPredictor`：
-  - 输入直接为 GPU 0/1 掩码（例如 32 维），reshape 为 `(batch, num_nodes, 8)`。
-  - 使用单一 Transformer 编码 + 注意力池化输出带宽预测。
+- `SimpleBandwidthPredictor`:
+  - Input is a GPU 0/1 mask (e.g., 32-dim), reshaped to `(batch, num_nodes, 8)`.
+  - Uses a single Transformer encoder + attention pooling to predict bandwidth.
 
-## 使用建议
-- 主模型与简化模型共享大部分超参（`hidden_dim`, `num_layers`, `num_heads`），在 `config/default_config.yaml` 中配置。
-- 若要启用 EWC，训练循环需在任务切换前调用 `save_old_params` 和 `update_fisher`，当前默认只调用 `save_old_params`（可按需扩展）。
+## Recommendations
+- Main and simplified models share most hyperparameters (`hidden_dim`, `num_layers`, `num_heads`), configured in `config/default_config.yaml`.
+- To enable EWC, training loops should call `save_old_params` and `update_fisher` before task switches; currently only `save_old_params` is called by default (extend as needed).
 

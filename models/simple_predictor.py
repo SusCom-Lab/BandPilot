@@ -1,4 +1,4 @@
-"""简化的带宽预测模型。"""
+"""Simplified bandwidth prediction model."""
 from __future__ import annotations
 
 from typing import Dict
@@ -10,7 +10,7 @@ from models.layers import AttentionPooling, PositionalEncoding
 
 
 class SimpleBandwidthPredictor(nn.Module):
-    """直接使用GPU掩码作为输入的简化模型。"""
+    """Simplified model that directly uses GPU masks as input."""
 
     def __init__(
         self,

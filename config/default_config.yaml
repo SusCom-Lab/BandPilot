@@ -1,11 +1,14 @@
-# 数据路径
+# Data paths
 data:
-  h100_data_path: './Data/H100_Real/Pune_H100_16M_binary.csv'
+  # H100 data for training/model inference (16M samples by default)
+  h100_training_data_path: './Data/H100/Pune_H100_16M_binary.csv'
+  # H100 data for real-data evaluation (2GB samples)
+  h100_evaluation_data_path: './Data/H100/Pune_H100_2GB_binary.csv'
   bandwidth_dict_dir: './Data/Bandwidth'
-  model_save_dir: './model/H100_Real'
-  evaluation_dir: './Data/Evaluation/H100_Real'
+  model_save_dir: './model'
+  evaluation_dir: './Data/Evaluation/'
 
-# 模型参数（将 type 设为 'full' 可启用 BandwidthPredictor，用于运行利用率/累积评估）
+# Model parameters (set type to 'full' to enable BandwidthPredictor for utilization/cumulative evaluation)
 model:
   type: 'full'
   hidden_dim: 32
@@ -14,45 +17,52 @@ model:
   dropout: 0.05
   node_count_embedding_dim: 8
 
-# 训练参数
+# Training parameters
 training:
+  enable_training: True  # false: skip training and load existing model ({model_save_dir}/{cluster_type}/bandwidth_predictor_ns{num_train_samples}.pth or simple_bandwidth_predictor_ns{num_train_samples}.pth)
   batch_size: 100
   num_epochs: 300
   learning_rate: 0.001
   weight_decay: 0.00001
   patience: 80
   lambda_ewc: 2.0
-  num_train_samples: 500
+  num_train_samples: 250
   num_test_samples: 1000
 
-# 集群配置
+# Cluster configuration
 cluster:
   total_gpu: 32
   cluster_types:
     - 'H100_26H100_27H100_28H100_29'
     - 'Het-4Mix'
-  bw_switch: 1111  #只是用于标识文件名而已
+  bw_switch: 1111  # only used as a filename tag
 
-# 评估配置（仅当 model.type = 'full' 时才会执行 compare.py 中的对比逻辑）
+# Evaluation configuration (compare.py logic runs only when model.type = 'full')
 evaluation:
-  enable_utilization: false   # true: 生成 Part_mean_* (带宽占比)
-  enable_accumulation: false  # true: 生成 Part_sum_* (与最优差距)
-  enable_multi_tenant: True # true: 运行多租户仿真，生成 multi_tenant_simulation.csv
-  repeat_num: 50              # 每个 test_num 的采样次数
-  if_dynamic: true            # true 表示可用 GPU 数量随机波动，false 表示所有 GPU 可用
+  enable_single_contention: true  # true: run single_dispatch_with_contention experiments
+  single_contention:          #---------------------
+    repeat_num: 50
+    if_dynamic: true
+    contention_mode:
+    - 'intensive'
+    - 'common'
+    - 'idle'
+    search_if_real_data: false
+  max_bw_offline:            #---------------------
+    enable: True            # true: collect max_bw cache offline
+    repeat_num: 50
+    if_dynamic: true
+    contention_mode:
+    - 'intensive'
+    - 'common'
+    - 'idle'
+    search_if_real_data: True
+    local_top_k: 10
+    max_combos_per_distribution: 2048
+    max_total_combos: 200000
   
-  # 多租户仿真配置
-  multi_tenant:
-    workload_mode: 'fixed_sum'  # 'fixed_sum': 生成总和为 total_gpu_sum 的随机序列; 'random': 随机生成 num_jobs 个任务
-    total_gpu_sum: 32           # fixed_sum 模式下的总GPU数
-    num_jobs: 100                # random 模式下的任务数量
-    job_sizes: [2, 4, 6, 10, 12, 14]     # 允许的任务大小列表
-    repeat_num: 
-      - 100       # 重复仿真次数
-    contention_mode: 
-      - 'common' # 'intensive': 满载争用, 'common': 中等随机占用, 'idle': 不争用
-
-# 其他
+# Others
 random_seed: 
-  - 1111 #1111
+  - 1111
 device: 'cuda'
+

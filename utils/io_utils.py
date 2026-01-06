@@ -1,4 +1,4 @@
-"""IO相关辅助函数。"""
+"""IO-related helper functions."""
 from __future__ import annotations
 
 import json
@@ -8,13 +8,13 @@ from typing import Any, Dict
 
 
 def load_pickle_dict(file_path: Path) -> Dict:
-    """加载pickle格式的字典。"""
+    """Load a dictionary from a pickle file."""
     if not file_path.exists():
-        raise FileNotFoundError(f"文件不存在: {file_path}")
+        raise FileNotFoundError(f"File does not exist: {file_path}")
     with file_path.open("rb") as f:
         data = pickle.load(f)
     if not isinstance(data, dict):
-        raise TypeError(f"文件 {file_path} 不包含字典")
+        raise TypeError(f"File {file_path} does not contain a dict")
     return data
 
 

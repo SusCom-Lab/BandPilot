@@ -1,4 +1,4 @@
-"""基线GPU分配算法。"""
+"""Baseline GPU allocation algorithms."""
 from __future__ import annotations
 
 import random
@@ -8,9 +8,9 @@ import numpy as np
 
 
 def random_algo(total_gpu: int, avail_gpu: Sequence[int], gpu_need: int) -> np.ndarray:
-    """在可用GPU中随机选择。"""
+    """Randomly select GPUs from available set."""
     if gpu_need > len(avail_gpu):
-        raise ValueError("需要的GPU数量超过可用数量")
+        raise ValueError("Requested GPU count exceeds available GPUs")
     best_gpu = np.zeros(total_gpu, dtype=int)
     selected_gpu = np.random.choice(avail_gpu, gpu_need, replace=False)
     for gpu in selected_gpu:
@@ -19,9 +19,9 @@ def random_algo(total_gpu: int, avail_gpu: Sequence[int], gpu_need: int) -> np.n
 
 
 def default_algo(total_gpu: int, avail_gpu: Sequence[int], gpu_need: int, verbose: bool = False) -> np.ndarray:
-    """基于节点/主机优先策略的GPU分配算法。"""
+    """Node/host-priority GPU allocation algorithm."""
     if gpu_need > len(avail_gpu):
-        raise ValueError("需要的GPU数量超过了可用的GPU数量")
+        raise ValueError("Requested GPU count exceeds available GPUs")
 
     avail_gpu = list(avail_gpu)
     best_gpu = np.zeros(total_gpu, dtype=int)
@@ -94,7 +94,7 @@ def default_algo(total_gpu: int, avail_gpu: Sequence[int], gpu_need: int, verbos
             best_gpu[gpu] = 1
         return best_gpu
 
-    # 1) 尽量使用单节点
+    # 1) Try to use single-node configurations
     if gpu_need <= node_size:
         node_candidates = [
             (node_id, gpus) for node_id, gpus in grouped_nodes.items() if len(gpus) >= gpu_need
@@ -104,7 +104,7 @@ def default_algo(total_gpu: int, avail_gpu: Sequence[int], gpu_need: int, verbos
             selected = sorted(node_candidates[0][1])[:gpu_need]
             return _finalize(selected)
 
-    # 2) 尽量使用单主机
+    # 2) Try to use single-host configurations
     host_candidates = [
         (host_id, gpus) for host_id, gpus in grouped_hosts.items() if len(gpus) >= gpu_need
     ]
@@ -115,7 +115,7 @@ def default_algo(total_gpu: int, avail_gpu: Sequence[int], gpu_need: int, verbos
         if len(selected) == gpu_need:
             return _finalize(selected)
 
-    # 3) 多主机补齐：从剩余主机依次取节点
+    # 3) Fill multi-host configurations: take nodes from remaining hosts sequentially
     ordered_hosts = sorted(grouped_hosts.items(), key=lambda item: (-len(item[1]), item[0]))
     aggregated: List[int] = []
     for host_id, gpus in ordered_hosts:
@@ -127,6 +127,6 @@ def default_algo(total_gpu: int, avail_gpu: Sequence[int], gpu_need: int, verbos
     if len(aggregated) >= gpu_need:
         return _finalize(aggregated[:gpu_need])
 
-    # 4) 兜底：使用全局最小编号的可用卡
+    # 4) Fallback: use the lowest-numbered available cards
     return _finalize(sorted_avail_gpu[:gpu_need])
 

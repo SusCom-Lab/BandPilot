@@ -1,23 +1,98 @@
-"""模型推理与评估工具。"""
+"""Model inference and evaluation utilities."""
 from __future__ import annotations
 
 import logging
 import pickle
+import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
 from core.bandwidth import SwitchBandwidthConfig, calculate_bandwidth_values
+from utils.helpers import build_artifact_filename, read_active_num_train_samples
 
 logger = logging.getLogger(__name__)
+
+class PredictionProfiler:
+    """Simple accumulator to record predict_with_model latency."""
+
+    __slots__ = ("total_time",)
+
+    def __init__(self) -> None:
+        self.total_time: float = 0.0
+
+    def add(self, duration: float) -> None:
+        self.total_time += duration
+
+
+_prediction_profiler_ctx: ContextVar[Optional[PredictionProfiler]] = ContextVar(
+    "prediction_profiler_ctx", default=None
+)
+
+
+@contextmanager
+def prediction_profiling_session():
+    """Start a profiling session to record prediction latency for a single algorithm run."""
+    profiler = PredictionProfiler()
+    token = _prediction_profiler_ctx.set(profiler)
+    try:
+        yield profiler
+    finally:
+        _prediction_profiler_ctx.reset(token)
 
 
 def _load_scaler(path: Path):
     with path.open("rb") as f:
         return pickle.load(f)
+
+
+def _ensure_num_train_samples(artifact_dir: Path, num_train_samples: Optional[int]) -> int:
+    """
+    Resolve the sample-count identifier to use.
+
+    Prefer an explicit num_train_samples; if absent, attempt to infer from
+    bw_scaler_ns*.pkl under artifact_dir. If multiple or unparsable, raise to
+    avoid misuse.
+    """
+    if num_train_samples is not None:
+        # Warn when an existing record differs from the provided value
+        try:
+            recorded = read_active_num_train_samples(artifact_dir)
+            if recorded != num_train_samples:
+                logger.warning(
+                    "Provided num_train_samples=%s differs from recorded %s; using the provided value.",
+                    num_train_samples,
+                    recorded,
+                )
+        except FileNotFoundError:
+            pass
+        return num_train_samples
+
+    try:
+        return read_active_num_train_samples(artifact_dir)
+    except (FileNotFoundError, ValueError):
+        pass
+
+    candidates = list(artifact_dir.glob("bw_scaler_ns*.pkl"))
+    if len(candidates) == 1:
+        stem = candidates[0].stem
+        # Expected format: bw_scaler_ns{num}
+        try:
+            return int(stem.split("_ns")[-1])
+        except (ValueError, IndexError):
+            raise ValueError(
+                f"Cannot infer num_train_samples from filename {candidates[0].name}; please pass it explicitly."
+            )
+
+    raise ValueError(
+        "Cannot infer num_train_samples; provide it explicitly "
+        "(cause: bw_scaler_ns*.pkl missing or multiple versions found)."
+    )
 
 
 def predict_with_model(
@@ -27,49 +102,70 @@ def predict_with_model(
     total_counts: np.ndarray,
     device: torch.device,
     artifact_dir: Path,
+    num_train_samples: Optional[int] = None,
 ) -> np.ndarray:
-    """对多节点配置使用模型进行预测，单节点直接返回局部带宽。"""
-    model.eval()
-    preds = np.zeros(len(part_bws))
-    multi_indices: List[int] = []
-    multi_part_bws: List[np.ndarray] = []
-    multi_node_counts: List[np.ndarray] = []
-    multi_total_counts: List[np.ndarray] = []
+    """Predict bandwidth for multi-node configurations; single-node cases fall back to local bandwidth."""
+    profiler = _prediction_profiler_ctx.get()
+    start_time = time.perf_counter() if profiler is not None else None
+    resolved_num_train_samples = _ensure_num_train_samples(
+        artifact_dir, num_train_samples
+    )
+    try:
+        model.eval()
+        preds = np.zeros(len(part_bws))
+        multi_indices: List[int] = []
+        multi_part_bws: List[np.ndarray] = []
+        multi_node_counts: List[np.ndarray] = []
+        multi_total_counts: List[np.ndarray] = []
 
-    for idx, part_bw in enumerate(part_bws):
-        nonzero = [j for j, value in enumerate(part_bw) if value > 0]
-        if len(nonzero) == 1:
-            preds[idx] = part_bw[nonzero[0]]
-        else:
-            multi_indices.append(idx)
-            multi_part_bws.append(part_bw)
-            multi_node_counts.append(node_counts[idx])
-            multi_total_counts.append(total_counts[idx])
+        for idx, part_bw in enumerate(part_bws):
+            nonzero = [j for j, value in enumerate(part_bw) if value > 0]
+            if len(nonzero) == 1:
+                preds[idx] = part_bw[nonzero[0]]
+            else:
+                multi_indices.append(idx)
+                multi_part_bws.append(part_bw)
+                multi_node_counts.append(node_counts[idx])
+                multi_total_counts.append(total_counts[idx])
 
-    if multi_part_bws:
-        bw_scaler = _load_scaler(artifact_dir / "bw_scaler.pkl")
-        total_scaler = _load_scaler(artifact_dir / "total_counts_scaler.pkl")
-        y_scaler = _load_scaler(artifact_dir / "y_scaler.pkl")
+        if multi_part_bws:
+            bw_scaler = _load_scaler(
+                artifact_dir
+                / build_artifact_filename("bw_scaler", resolved_num_train_samples, ".pkl")
+            )
+            total_scaler = _load_scaler(
+                artifact_dir
+                / build_artifact_filename(
+                    "total_counts_scaler", resolved_num_train_samples, ".pkl"
+                )
+            )
+            y_scaler = _load_scaler(
+                artifact_dir
+                / build_artifact_filename("y_scaler", resolved_num_train_samples, ".pkl")
+            )
 
-        multi_part_bws_np = np.array(multi_part_bws)
-        multi_node_counts_np = np.array(multi_node_counts)
-        multi_total_counts_np = np.array(multi_total_counts)
+            multi_part_bws_np = np.array(multi_part_bws)
+            multi_node_counts_np = np.array(multi_node_counts)
+            multi_total_counts_np = np.array(multi_total_counts)
 
-        num_samples, seq_len = multi_part_bws_np.shape
-        scaled_part_bws = bw_scaler.transform(multi_part_bws_np.reshape(-1, 1)).reshape(num_samples, seq_len)
-        scaled_total_counts = total_scaler.transform(multi_total_counts_np)
+            num_samples, seq_len = multi_part_bws_np.shape
+            scaled_part_bws = bw_scaler.transform(multi_part_bws_np.reshape(-1, 1)).reshape(num_samples, seq_len)
+            scaled_total_counts = total_scaler.transform(multi_total_counts_np)
 
-        t_bws = torch.tensor(scaled_part_bws, dtype=torch.float32, device=device)
-        t_node_counts = torch.tensor(multi_node_counts_np, dtype=torch.long, device=device)
-        t_total_counts = torch.tensor(scaled_total_counts, dtype=torch.float32, device=device)
+            t_bws = torch.tensor(scaled_part_bws, dtype=torch.float32, device=device)
+            t_node_counts = torch.tensor(multi_node_counts_np, dtype=torch.long, device=device)
+            t_total_counts = torch.tensor(scaled_total_counts, dtype=torch.float32, device=device)
 
-        with torch.no_grad():
-            outputs = model(t_bws, t_node_counts, t_total_counts)["final_bandwidth"].view(-1).cpu().numpy()
-        preds_multi = y_scaler.inverse_transform(outputs.reshape(-1, 1)).flatten()
+            with torch.no_grad():
+                outputs = model(t_bws, t_node_counts, t_total_counts)["final_bandwidth"].view(-1).cpu().numpy()
+            preds_multi = y_scaler.inverse_transform(outputs.reshape(-1, 1)).flatten()
 
-        for idx, pred in zip(multi_indices, preds_multi):
-            preds[idx] = round(pred,0)
-    return preds
+            for idx, pred in zip(multi_indices, preds_multi):
+                preds[idx] = round(pred,0)
+        return preds
+    finally:
+        if profiler is not None and start_time is not None:
+            profiler.add(time.perf_counter() - start_time)
 
 
 def evaluate_model(
@@ -79,24 +175,31 @@ def evaluate_model(
     total_gpu: int,
     gpu_bw_dict_list,
     switch_config: SwitchBandwidthConfig | float | None,
-    data_path: str,
+    training_data_path: str,
     artifact_dir: Path,
+    num_train_samples: Optional[int] = None,
 ) -> Tuple[float, float]:
-    """评估主模型性能。
-    
-    评估过程中会收集所有预测值和真实值，并在评估结束后保存到 pickle 文件中，
-    文件保存在 artifact_dir 目录下，文件名格式为 test_loader_data_{样本数}Data.pkl
+    """Evaluate the full model on a test loader.
+
+    Collect all predictions/targets and persist them to a pickle file in
+    artifact_dir named test_loader_data_{num_samples}Data.pkl.
     """
     model.eval()
     mse_total = 0.0
     mae_total = 0.0
     total_samples = 0
-
-    # 用于收集所有预测值和真实值
+    
+    # Collect all predictions and ground-truth values for later persistence.
     all_preds: List[torch.Tensor] = []
     all_targets: List[torch.Tensor] = []
 
-    y_scaler = _load_scaler(artifact_dir / "y_scaler.pkl")
+    resolved_num_train_samples = _ensure_num_train_samples(
+        artifact_dir, num_train_samples
+    )
+    y_scaler = _load_scaler(
+        artifact_dir
+        / build_artifact_filename("y_scaler", resolved_num_train_samples, ".pkl")
+    )
 
     with torch.no_grad():
         for x_bws, x_node_counts, x_total_counts, y_batch in test_loader:
@@ -123,22 +226,22 @@ def evaluate_model(
             mse_total += mse.item()
             mae_total += mae.item()
             total_samples += batch_size
-
-            # 记录所有预测值和真实值（使用逆变换后的值）
+            
+            # Record all predictions and targets (after inverse scaling) for later analysis.
             all_preds.append(pred_tensor.detach().cpu())
             all_targets.append(target_tensor.detach().cpu())
 
     mse_avg = mse_total / total_samples
     mae_avg = mae_total / total_samples
-
-    # 保存测试集数据和预测结果
+    
+    # Persist the full test set data and prediction results for offline inspection.
     all_preds_np = torch.cat(all_preds, dim=0).numpy()
     all_targets_np = torch.cat(all_targets, dim=0).numpy()
     
-    # 确保 artifact_dir 存在
+    # Ensure artifact_dir exists
     artifact_dir.mkdir(parents=True, exist_ok=True)
     
-    # 生成文件名：test_loader_data_{样本数}Data.pkl
+    # Build filename: test_loader_data_{num_samples}Data.pkl
     num_samples = len(all_preds_np)
     save_path = artifact_dir / f"test_loader_data_{num_samples}Data.pkl"
     
@@ -151,8 +254,8 @@ def evaluate_model(
             f,
         )
     
-    logger.info(f"测试集数据及预测结果已保存到 {save_path}")
-    logger.info(f"测试集样本数: {num_samples}, MSE: {mse_avg:.4f}, MAE: {mae_avg:.4f}")
+    logger.info(f"Test set data and predictions saved to {save_path}")
+    logger.info(f"Test samples: {num_samples}, MSE: {mse_avg:.4f}, MAE: {mae_avg:.4f}")
 
     return mse_avg, mae_avg
 
@@ -162,14 +265,21 @@ def evaluate_simple_model(
     test_loader,
     device: torch.device,
     artifact_dir: Path,
+    num_train_samples: Optional[int] = None,
 ) -> Tuple[float, float]:
-    """评估简化模型。"""
+    """Evaluate the simplified model that operates directly on part-bandwidth sequences."""
     model.eval()
     mse_total = 0.0
     mae_total = 0.0
     total_samples = 0
 
-    y_scaler = _load_scaler(artifact_dir / "simple_y_scaler.pkl")
+    resolved_num_train_samples = _ensure_num_train_samples(
+        artifact_dir, num_train_samples
+    )
+    y_scaler = _load_scaler(
+        artifact_dir
+        / build_artifact_filename("simple_y_scaler", resolved_num_train_samples, ".pkl")
+    )
 
     with torch.no_grad():
         for x_bws, y_batch in test_loader:

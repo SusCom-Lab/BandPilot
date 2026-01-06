@@ -1,4 +1,4 @@
-"""模拟Slurm拓扑感知分配算法及k-clique采样。"""
+"""Simulated Slurm topology-aware allocation and k-clique sampling."""
 from __future__ import annotations
 
 import itertools
@@ -25,44 +25,108 @@ def slurm_best_fit_algo(
     topo_matrix: pd.DataFrame,
     gpu_to_node_map: Dict[int, int],
 ) -> np.ndarray:
-    """模仿Slurm Best-Fit策略。"""
+    """Slurm-like best-fit strategy (improved: topology-aware across nodes).
+
+    Compactness is defined as “using as few nodes as possible”; under the same node count,
+    choose the GPU combo with best connectivity via topo_matrix/connectivity_score.
+    """
+    # Initialize result mask
     final_mask = np.zeros(total_gpu, dtype=int)
     if gpu_need <= 0:
         return final_mask
 
-    valid_avail = sorted([gpu for gpu in avail_gpu_indices if 0 <= gpu < total_gpu])
+    # Normalize available GPU indices
+    valid_avail = sorted({gpu for gpu in avail_gpu_indices if 0 <= gpu < total_gpu})
     if gpu_need > len(valid_avail):
-        logger.error("需要的GPU数量超过可用数量")
+        logger.error("Requested GPU count (%d) exceeds available (%d)", gpu_need, len(valid_avail))
         return final_mask
 
+    # Group available GPUs by node
     gpus_on_nodes: Dict[int, List[int]] = {}
     for gpu_idx in valid_avail:
         node_idx = gpu_to_node_map.get(gpu_idx, -1)
         gpus_on_nodes.setdefault(node_idx, []).append(gpu_idx)
 
-    candidate_nodes = [node for node, gpus in gpus_on_nodes.items() if len(gpus) >= gpu_need]
-    if candidate_nodes:
-        best_selection: List[int] = []
-        best_score = -1.0
-        for node_idx in candidate_nodes:
-            available = gpus_on_nodes[node_idx]
-            for combo in itertools.combinations(available, gpu_need):
-                score = calculate_connectivity_score(combo, topo_matrix)
-                if score > best_score:
-                    best_score = score
-                    best_selection = list(combo)
-        final_mask[best_selection] = 1
+    nodes = sorted(gpus_on_nodes.keys())
+
+    # Final selected GPU combo
+    best_selection: List[int] = []
+    best_score: float = -1.0
+
+    # Search node_count from small to large to enforce compactness
+    for node_count in range(1, len(nodes) + 1):
+        best_for_this_node_count: List[int] = []
+        best_score_for_this_node_count: float = -1.0
+        found_candidate = False
+
+        # Enumerate all node_count-sized node subsets
+        for node_subset in itertools.combinations(nodes, node_count):
+            # Count available GPUs on this node subset; skip if insufficient
+            union_gpus: List[int] = []
+            for n in node_subset:
+                union_gpus.extend(gpus_on_nodes[n])
+            if len(union_gpus) < gpu_need:
+                continue
+
+            # Greedily select gpu_need GPUs from the union to maximize connectivity_score.
+            union_gpus = sorted(union_gpus)
+            selected: List[int] = []
+            remaining = union_gpus.copy()
+
+            while len(selected) < gpu_need and remaining:
+                best_gpu = None
+                best_partial_score = -1.0
+
+                for g in remaining:
+                    combo = selected + [g]
+                    score = calculate_connectivity_score(combo, topo_matrix)
+                    if score > best_partial_score:
+                        best_partial_score = score
+                        best_gpu = g
+
+                if best_gpu is None:
+                    # Should not happen in theory; defensive exit
+                    break
+
+                selected.append(best_gpu)
+                remaining.remove(best_gpu)
+
+            if len(selected) != gpu_need:
+                # Node subset cannot yield a full combo; skip
+                continue
+
+            # Recompute final score for complete combo
+            final_score = calculate_connectivity_score(selected, topo_matrix)
+            found_candidate = True
+
+            # Keep best connectivity_score under same node_count
+            if final_score > best_score_for_this_node_count:
+                best_score_for_this_node_count = final_score
+                best_for_this_node_count = selected
+
+        # If any feasible plan exists for this node_count, since we increase node_count,
+        # this is the most compact node usage; keep best connectivity among them.
+        if found_candidate and best_for_this_node_count:
+            best_selection = best_for_this_node_count
+            best_score = best_score_for_this_node_count
+            break
+
+    if not best_selection:
+        # Should not happen in theory (gpu_need <= len(valid_avail)); defensive log
+        logger.error(
+            "slurm_best_fit_algo found no feasible allocation: gpu_need=%d, avail=%d",
+            gpu_need,
+            len(valid_avail),
+        )
         return final_mask
 
-    selected: List[int] = []
-    sorted_nodes = sorted(gpus_on_nodes.items(), key=lambda item: len(item[1]), reverse=True)
-    for _, gpus in sorted_nodes:
-        needed = gpu_need - len(selected)
-        take = gpus[:needed]
-        selected.extend(take)
-        if len(selected) >= gpu_need:
-            break
-    final_mask[selected[:gpu_need]] = 1
+    final_mask[best_selection] = 1
+    logger.debug(
+        "slurm_best_fit_algo selected GPUs: %s, node_count=%d, connectivity_score=%.4f",
+        best_selection,
+        len({gpu_to_node_map.get(i, -1) for i in best_selection}),
+        best_score,
+    )
     return final_mask
 
 
@@ -79,7 +143,7 @@ def k_clique_bandwidth_sampling_search(
     artifact_dir: Path,
     sample_factor: int = 3,
 ) -> np.ndarray:
-    """基于模型预测权重的随机采样搜索。"""
+    """Randomized sampling search guided by model-predicted bandwidth weights."""
     if gpu_need <= 0 or len(avail_gpu) < gpu_need:
         return np.zeros(num_dimensions, dtype=int)
 

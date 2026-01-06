@@ -1,4 +1,4 @@
-"""通用神经网络层。"""
+"""Common neural network layers."""
 from __future__ import annotations
 
 import math
@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 
 class PositionalEncoding(nn.Module):
-    """Transformer位置编码。"""
+    """Transformer positional encoding."""
 
     def __init__(self, d_model: int, max_len: int = 100):
         super().__init__()
@@ -28,7 +28,7 @@ class PositionalEncoding(nn.Module):
 
 
 class AttentionPooling(nn.Module):
-    """自适应注意力池化。"""
+    """Adaptive attention pooling."""
 
     def __init__(self, d_model: int):
         super().__init__()

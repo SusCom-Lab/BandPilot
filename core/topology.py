@@ -1,4 +1,4 @@
-"""拓扑结构相关函数。"""
+"""Topology-related utilities."""
 from __future__ import annotations
 
 import logging
@@ -12,10 +12,10 @@ logger = logging.getLogger(__name__)
 
 
 def parse_topo_matrix(filepath: str | Path) -> pd.DataFrame:
-    """解析单节点拓扑结构文件（如A6000_topo.txt）。"""
+    """Parse a single-node topology file (e.g., A6000_topo.txt)."""
     path = Path(filepath)
     if not path.exists():
-        raise FileNotFoundError(f"拓扑文件未找到: {filepath}")
+        raise FileNotFoundError(f"Topology file not found: {filepath}")
 
     with path.open("r", encoding="utf-8") as f:
         lines = [line.strip() for line in f if line.strip()]
@@ -26,15 +26,15 @@ def parse_topo_matrix(filepath: str | Path) -> pd.DataFrame:
     matrix = [[cell.strip() for cell in row[1:]] for row in data_lines]
 
     if len(row_labels) != len(matrix):
-        raise ValueError("拓扑文件的行数与标签不匹配")
+        raise ValueError("Row count does not match labels in topology file")
     if matrix and len(matrix[0]) != len(header):
-        raise ValueError("拓扑文件的列数与标签不匹配")
+        raise ValueError("Column count does not match labels in topology file")
 
     return pd.DataFrame(matrix, index=row_labels, columns=header)
 
 
 def build_composite_topo_matrix(node_configs: Sequence[Tuple[str, int]]) -> Tuple[pd.DataFrame, int]:
-    """构建复合拓扑矩阵。"""
+    """Build a composite topology matrix."""
     parsed: Dict[str, pd.DataFrame] = {}
     total_gpu = 0
     offsets = [0]
@@ -43,7 +43,7 @@ def build_composite_topo_matrix(node_configs: Sequence[Tuple[str, int]]) -> Tupl
         if topo_file not in parsed:
             parsed[topo_file] = parse_topo_matrix(topo_file)
             if parsed[topo_file].shape[0] != gpus_on_node:
-                raise ValueError(f"{topo_file} 的GPU数量与配置不一致")
+                raise ValueError(f"GPU count in {topo_file} mismatches configuration")
         total_gpu += gpus_on_node
         offsets.append(total_gpu)
 
@@ -67,27 +67,27 @@ def build_composite_topo_matrix(node_configs: Sequence[Tuple[str, int]]) -> Tupl
 
 
 def get_link_weight(link_type: str) -> int:
-    """根据连接类型返回权重。
-    
-    支持的连接类型：
-    - X, INTER: 权重 0（无连接或跨节点）
-    - SYS: 权重 1
-    - PIX: 权重 1.5
-    - PXB: 权重 2
-    - NV<N>: NVLink 连接，根据版本号返回权重（NV16+ -> 6, NV8+ -> 5, NV4+ -> 4, NV1+ -> 3）
+    """Return weight for a given link type.
+
+    Supported link types:
+    - X, INTER: weight 0 (no link or cross-node)
+    - SYS: weight 1
+    - PIX: weight 1.5
+    - PXB: weight 2
+    - NV<N>: NVLink; weight by version (NV16+ -> 6, NV8+ -> 5, NV4+ -> 4, NV1+ -> 3)
     """
     mapping = {"X": 0, "INTER": 0, "SYS": 1, "PIX": 1.5, "PXB": 2}
     link_type = link_type.strip().upper()
-    # 首先检查是否在预定义映射中
+    # First check predefined mapping
     if link_type in mapping:
         return mapping[link_type]
-    # 处理 NVLink 类型（如 NV16, NV8, NV4 等）
+    # Handle NVLink types (e.g., NV16, NV8, NV4)
     if link_type.startswith("NV"):
-        # 修复：在原始字符串中应使用 \d+ 而不是 \\d+
+        # Should use \d+ in the original regex
         match = re.match(r"NV(\d+)", link_type)
         if match:
             num = int(match.group(1))
-            # 根据 NVLink 版本号返回不同权重
+            # Weight based on NVLink version
             if num >= 16:
                 return 6
             if num >= 8:
@@ -96,17 +96,17 @@ def get_link_weight(link_type: str) -> int:
                 return 4
             if num >= 1:
                 return 3
-    # 如果无法识别连接类型，记录警告并返回 0
-    logger.warning("未知连接类型 %s，按0处理", link_type)
+    # Unknown link type: warn and return 0
+    logger.warning("Unknown link type %s, treating as 0", link_type)
     return 0
 
 
 def calculate_connectivity_score(gpu_indices: Sequence[int], topo_matrix: pd.DataFrame) -> float:
-    """计算给定GPU集合的连接权重得分。"""
+    """Compute connectivity weight score for a given GPU set."""
     score = 0.0
     valid_indices = [idx for idx in sorted(gpu_indices) if 0 <= idx < topo_matrix.shape[0]]
     if len(valid_indices) != len(gpu_indices):
-        logger.warning("GPU索引存在越界: all=%s, valid=%s", gpu_indices, valid_indices)
+        logger.warning("GPU indices out of range: all=%s, valid=%s", gpu_indices, valid_indices)
 
     for i in range(len(valid_indices)):
         for j in range(i + 1, len(valid_indices)):
@@ -116,35 +116,35 @@ def calculate_connectivity_score(gpu_indices: Sequence[int], topo_matrix: pd.Dat
 
 
 def convert_cluster_type_to_node_configs(cluster_type: str, gpu_num: int) -> List[Tuple[str, int]]:
-    """根据cluster_type生成节点配置。"""
-    # 导入自定义集群类型配置
+    """Generate node configs from cluster_type."""
+    # Import custom cluster type configurations
     from core.bandwidth import CUSTOM_CLUSTER_NODE_TYPES
     
     node_configs: List[Tuple[str, int]] = []
     
-    # 检查是否是自定义集群类型（如 Het-4Mix）
+    # Check custom cluster types (e.g., Het-4Mix)
     if cluster_type in CUSTOM_CLUSTER_NODE_TYPES:
         node_types = CUSTOM_CLUSTER_NODE_TYPES[cluster_type]
         for model in node_types:
             node_configs.append((f"Data/Topology/{model}_topo.txt", 8))
     else:
-        # 原有的逻辑：从 cluster_type 字符串中提取 GPU 模型
+        # Legacy logic: extract GPU models from cluster_type string
         gpu_models = ["4090", "V100", "A6000", "A800", "H100_26", "H100_27", "H100_28", "H100_29"]
         extracted = [model for model in gpu_models if model in cluster_type]
 
         if "H100_26" in extracted:
-            node_configs = [("Data/H100_Real/H100_topo.txt", 8) for _ in extracted]
+            node_configs = [("Data/H100/H100_topo.txt", 8) for _ in extracted]
         else:
             for model in extracted:
                 node_configs.append((f"Data/Topology/{model}_topo.txt", 8))
 
-        # 如果节点数不足，循环添加
+        # If nodes are insufficient, repeat in round-robin
         total = sum(count for _, count in node_configs)
         idx = 0
         while total < gpu_num and extracted:
             model = extracted[idx % len(extracted)]
             if "H100_26" in extracted:
-                node_configs.append(("Data/H100_Real/H100_topo.txt", 8))
+                node_configs.append(("Data/H100/H100_topo.txt", 8))
             else:
                 node_configs.append((f"Data/Topology/{model}_topo.txt", 8))
             total += 8
@@ -154,7 +154,7 @@ def convert_cluster_type_to_node_configs(cluster_type: str, gpu_num: int) -> Lis
 
 
 def create_gpu_to_node_map(node_configs: Sequence[Tuple[str, int]]) -> Dict[int, int]:
-    """创建全局GPU索引到节点索引的映射。"""
+    """Create mapping from global GPU index to node index."""
     mapping: Dict[int, int] = {}
     start = 0
     for node_idx, (_, gpu_count) in enumerate(node_configs):

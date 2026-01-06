@@ -1,4 +1,4 @@
-"""搜索与组合生成算法集合（支持多租户感知）。"""
+"""Search and combination-generation algorithms (multi-tenant aware)."""
 from __future__ import annotations
 
 import itertools
@@ -11,86 +11,30 @@ import numpy as np
 from core.bandwidth import SwitchBandwidthConfig, calculate_bandwidth_values, prepare_model_inputs
 from core.gpu_config import generate_data_minmax_restricted
 from training.evaluator import predict_with_model
-# 只有类型检查时导入，避免循环依赖
+# Imported only for type checking to avoid circular dependencies at runtime.
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from core.cluster_state import ClusterStateManager
 logger = logging.getLogger(__name__)
 
 
+def _select_data_path_for_mode(
+    use_real_data: bool,
+    training_data_path: str,
+    evaluation_data_path: Optional[str],
+) -> str:
+    """Pick data path based on mode; fallback to training path when evaluation path is missing."""
+    if use_real_data and evaluation_data_path:
+        return evaluation_data_path
+    return training_data_path
+
+
 def generate_next_combos(combo: np.ndarray) -> np.ndarray:
-    """生成所有将单个1变为0的组合。"""
+    """Generate all combos formed by flipping a single 1 to 0."""
     indices = np.where(combo == 1)[0]
     next_combos = np.tile(combo, (len(indices), 1))
     next_combos[np.arange(len(indices)), indices] = 0
     return next_combos
-
-
-def generate_add_combos(combo: np.ndarray, avail_gpu: Sequence[int], num_dimensions: int) -> np.ndarray:
-    """生成所有在可用GPU上增加一个1的组合。"""
-    current_zeros = np.where(combo == 0)[0]
-    valid_indices = [idx for idx in current_zeros if idx in avail_gpu]
-    if not valid_indices:
-        return np.array([])
-    next_combos = np.tile(combo, (len(valid_indices), 1))
-    for i, idx in enumerate(valid_indices):
-        next_combos[i, idx] = 1
-    return next_combos
-
-
-def find_best_2gpu_combo(
-    avail_gpu: Sequence[int],
-    model,
-    total_gpu: int,
-    gpu_bw_dict_list,
-    switch_config: SwitchBandwidthConfig | float | None,
-    num_dimensions: int,
-    data_path: str,
-    device,
-    artifact_dir: Path,
-    if_real_data: bool = False,
-    cluster_manager: Optional['ClusterStateManager'] = None,
-) -> Optional[np.ndarray]:
-    """遍历所有2卡组合，寻找最佳起点。"""
-    combos = []
-    for pair in itertools.combinations(avail_gpu, 2):
-        combo = np.zeros(num_dimensions, dtype=int)
-        combo[list(pair)] = 1
-        combos.append(combo)
-    if not combos:
-        return None
-    all_combos = np.array(combos)
-    
-    # 优先使用 cluster_manager 进行带宽评估
-    if cluster_manager:
-        # 多租户场景：直接依赖集群状态管理器的实时预测，避免重复构造模型输入
-        best_idx = -1
-        best_bw = -1.0
-        for idx, combo in enumerate(all_combos):
-            bw = cluster_manager.predict_with_contention(combo)
-            if bw > best_bw:
-                best_bw = bw
-                best_idx = idx
-        return all_combos[best_idx] if best_idx >= 0 else None
-    elif if_real_data:
-        # 真实数据模式：遍历所有组合并用测得的带宽排序
-        best_idx = -1
-        best_bw = -1
-        for idx, combo in enumerate(all_combos):
-            bw_value, _, _ = calculate_bandwidth_values(
-                combo, total_gpu, gpu_bw_dict_list, switch_config, data_path
-            )
-            if bw_value > best_bw:
-                best_bw = bw_value
-                best_idx = idx
-        return all_combos[best_idx] if best_idx >= 0 else None
-
-    # 模型预测模式：一次性批量构造输入，减少推理次数
-    part_bws, node_counts, total_counts = prepare_model_inputs(
-        all_combos, total_gpu, gpu_bw_dict_list, switch_config, data_path
-    )
-    scores = predict_with_model(model, part_bws, node_counts, total_counts, device, artifact_dir)
-    return all_combos[int(np.argmax(scores))]
 
 
 def greedy_recursive_search(
@@ -100,65 +44,73 @@ def greedy_recursive_search(
     total_gpu: int,
     gpu_bw_dict_list,
     switch_config: SwitchBandwidthConfig | float | None,
-    data_path: str,
+    training_data_path: str,
     device,
     artifact_dir: Path,
     if_real_data: bool = False,
     cluster_manager: Optional['ClusterStateManager'] = None,
     global_mode: bool = False,
     avail_gpu: Optional[Sequence[int]] = None,
+    global_mode_all: bool = False,
+    evaluation_data_path: Optional[str] = None,
 ) -> np.ndarray:
     """
-    递归式贪心搜索：不断剔除一个GPU直至满足需求。
-    
-    :param global_mode: 如果为 True，使用全局带宽评估（当前配置带宽 + 剩余GPU带宽）
-    :param avail_gpu: 可用GPU列表，global_mode=True 时需要提供
+    Recursive greedy search: keep removing one GPU until reaching gpu_need.
+
+    :param global_mode: If True, score with global bandwidth (current + remaining GPUs)
+    :param avail_gpu: Available GPUs; required when global_mode=True
+    :param global_mode_all: When global_mode=True and this is True, global score =
+        current combo + historical combos + remaining GPUs.
     """
     ones_count = int(np.sum(current_combo))
     if ones_count == gpu_need:
         return current_combo
 
-    # 生成所有可能的单卡剔除方案
+    # Generate all single-GPU removal candidates
     candidate_combos = generate_next_combos(current_combo)
     
-    # 修改：带宽评估逻辑，优先使用 cluster_manager
+    # Bandwidth evaluation logic: prefer cluster_manager when available
     scores = []
     if cluster_manager:
-        # 多租户模式：考虑争用
+        # Multi-tenant mode: consider contention
         if global_mode and avail_gpu is not None:
-            # 全局模式：评估全局带宽（当前配置 + 剩余GPU）
+            # Global mode: evaluate combined bandwidth (current combo + remaining GPUs)
             num_dimensions = len(current_combo)
             for combo in candidate_combos:
-                # 每个候选都需要结合剩余 GPU 进行全局评估
+                # Each candidate needs global evaluation with remaining GPUs
                 bw = _evaluate_global_bandwidth(
-                    combo, avail_gpu, num_dimensions, cluster_manager
+                    combo,
+                    avail_gpu,
+                    num_dimensions,
+                    cluster_manager,
+                    global_mode_all=global_mode_all,
                 )
                 scores.append(bw)
         else:
-            # 普通模式：只评估当前配置
+            # Standard mode: only evaluate current combo
             for combo in candidate_combos:
                 bw = cluster_manager.predict_with_contention(combo)
                 scores.append(bw)
     elif if_real_data:
+        real_path = _select_data_path_for_mode(True, training_data_path, evaluation_data_path)
         for combo in candidate_combos:
             bw_value, _, _ = calculate_bandwidth_values(
-                combo, total_gpu, gpu_bw_dict_list, switch_config, data_path
+                combo, total_gpu, gpu_bw_dict_list, switch_config, real_path
             )
             scores.append(bw_value)
     else:
-        # 通过一次批量推理拿到所有候选配置的带宽预测
+        # Batch inference for all candidate bandwidth predictions
         part_bws, node_counts, total_counts = prepare_model_inputs(
-            candidate_combos, total_gpu, gpu_bw_dict_list, switch_config, data_path
+            candidate_combos, total_gpu, gpu_bw_dict_list, switch_config, training_data_path
         )
         scores = predict_with_model(model, part_bws, node_counts, total_counts, device, artifact_dir)
-        # predict_with_model 返回的是 tensor 或 array，确保转为 list
+        # predict_with_model may return tensor/array; ensure list
         if hasattr(scores, 'tolist'):
             scores = scores.tolist()
         elif hasattr(scores, '__iter__') and not isinstance(scores, (list, tuple)):
             scores = list(scores)
             
-    # 选出带宽得分最高的组合并继续向下递归
-    # 根据得分选择下一轮起点，继续递归逼近目标 GPU 数
+    # Pick highest-bandwidth combo and recurse toward target GPU count
     best_idx = int(np.argmax(scores))
     best_next_combo = candidate_combos[best_idx]
     
@@ -169,13 +121,15 @@ def greedy_recursive_search(
         total_gpu,
         gpu_bw_dict_list,
         switch_config,
-        data_path,
+        training_data_path,
         device,
         artifact_dir,
         if_real_data,
-        cluster_manager=cluster_manager,  # 递归传递
-        global_mode=global_mode,  # 递归传递
-        avail_gpu=avail_gpu,  # 递归传递
+        cluster_manager=cluster_manager,  # pass through recursively
+        global_mode=global_mode,  # pass through recursively
+        avail_gpu=avail_gpu,  # pass through recursively
+        global_mode_all=global_mode_all,  # pass through recursively
+        evaluation_data_path=evaluation_data_path,
     )
 
 
@@ -187,32 +141,36 @@ def tree_search_only(
     total_gpu: int,
     gpu_bw_dict_list,
     switch_config: SwitchBandwidthConfig | float | None,
-    data_path: str,
+    training_data_path: str,
     device,
     artifact_dir: Path,
     if_real_data: bool = False,
     cluster_manager: Optional['ClusterStateManager'] = None,
     global_mode: bool = False,
+    global_mode_all: bool = False,
+    evaluation_data_path: Optional[str] = None,
 ) -> Optional[np.ndarray]:
     """
-    改进的搜索算法：从最大集合剔除，支持节点插入优化，且可选全局带宽评估。
-    
-    :param num_dimensions: GPU总数
-    :param avail_gpu: 可用GPU列表
-    :param model: 预测模型
-    :param gpu_need: 需要的GPU数量
-    :param total_gpu: 总GPU数
-    :param gpu_bw_dict_list: GPU带宽字典
-    :param switch_config: 交换机配置
-    :param data_path: 数据路径
-    :param device: 设备
-    :param artifact_dir: 模型目录
-    :param if_real_data: 是否使用真实数据
-    :param global_mode: 是否基于“已选 + 剩余”计算全局带宽（需 cluster_manager）
-    :return: 最优GPU组合
+    Improved search: remove from the largest set, support node/host insertion,
+    optionally evaluate global bandwidth.
+
+    :param num_dimensions: Total GPUs
+    :param avail_gpu: Available GPU list
+    :param model: Prediction model
+    :param gpu_need: Required GPU count
+    :param total_gpu: Total GPUs
+    :param gpu_bw_dict_list: GPU bandwidth dictionaries
+    :param switch_config: Switch config
+    :param training_data_path: Data path for model prediction
+    :param device: Device
+    :param artifact_dir: Artifact directory
+    :param if_real_data: Use real data if True
+    :param global_mode: If True, score global bandwidth (“selected + remaining”) via cluster_manager
+    :param global_mode_all: If True with global_mode, global score = current + history + remaining
+    :return: Best GPU combo
     """
     if len(avail_gpu) < gpu_need:
-        logger.warning("可用GPU数量小于需求数量")
+        logger.warning("Available GPUs are fewer than required")
         return None
 
     if len(avail_gpu) == gpu_need:
@@ -228,24 +186,31 @@ def tree_search_only(
     avail_set = set(avail_gpu)
 
     def _score_combo(combo: np.ndarray, use_real_data: bool) -> float:
-        """统一输出当前组合的得分，必要时启用全局带宽评估。"""
+        """Score current combo, optionally using global bandwidth evaluation."""
         if global_mode and cluster_manager:
-            return _evaluate_global_bandwidth(combo, avail_gpu, num_dimensions, cluster_manager)
+            return _evaluate_global_bandwidth(
+                combo,
+                avail_gpu,
+                num_dimensions,
+                cluster_manager,
+                global_mode_all=global_mode_all,
+            )
         return _evaluate_bandwidth(
             combo,
             model,
             total_gpu,
             gpu_bw_dict_list,
             switch_config,
-            data_path,
+            training_data_path,
             device,
             artifact_dir,
             use_real_data,
             cluster_manager,
+            evaluation_data_path,
         )
 
     def _run_tree_paths(start_combo: np.ndarray, use_real_data: bool) -> np.ndarray:
-        """从指定起点运行单卡剔除路径。"""
+        """Run single-card removal path from the given start combo."""
         combo_from_subtract = greedy_recursive_search(
             current_combo=start_combo,
             gpu_need=gpu_need,
@@ -253,18 +218,20 @@ def tree_search_only(
             total_gpu=total_gpu,
             gpu_bw_dict_list=gpu_bw_dict_list,
             switch_config=switch_config,
-            data_path=data_path,
+            training_data_path=training_data_path,
             device=device,
             artifact_dir=artifact_dir,
             if_real_data=use_real_data,
             cluster_manager=cluster_manager,
             global_mode=global_mode,
             avail_gpu=avail_gpu,
+            global_mode_all=global_mode_all,
+            evaluation_data_path=evaluation_data_path,
         )
         return combo_from_subtract
 
     def _select_best_complete_group(group_list: List[List[int]]) -> Optional[np.ndarray]:
-        """从可用节点/主机中选出带宽最高的一个组合。"""
+        """Pick the best-bandwidth combo among available nodes/hosts."""
         candidates = [group for group in group_list if set(group).issubset(avail_set)]
         if not candidates:
             return None
@@ -285,16 +252,17 @@ def tree_search_only(
         return combo
 
     def _attempt_insert(group_list: List[List[int]], limit: int) -> Optional[np.ndarray]:
-        """若所需 GPU 在 limit 内，尝试整节点/整机插入并直接运行树搜索。"""
+        """If gpu_need <= limit, try whole-node/host insertion then run tree search."""
         if gpu_need > limit:
             return None
         start_combo = _select_best_complete_group(group_list)
         if start_combo is None:
             return None
-        # 历史逻辑：插入后统一按真实数据路径评估，以保证带宽排序一致
+        # Historical design choice: once a node/host is inserted, always evaluate using the real-data path
+        # to ensure consistent bandwidth ordering across candidates.
         return _run_tree_paths(start_combo, use_real_data=True)
 
-    # 先尝试四卡节点，再尝试八卡主机，均失败时退回最大集合
+    # Try 4-GPU node, then 8-GPU host; if both fail, fall back to max set
     node_result = _attempt_insert(complete_node_list, limit=4)
     if node_result is not None:
         return node_result
@@ -317,25 +285,28 @@ def _try_node_insert_optimization(
     total_gpu: int,
     gpu_bw_dict_list,
     switch_config: SwitchBandwidthConfig | float | None,
-    data_path: str,
+    training_data_path: str,
     device,
     artifact_dir: Path,
     if_real_data: bool,
     cluster_manager: Optional['ClusterStateManager'],
     global_mode: bool = False,
+    global_mode_all: bool = False,
+    evaluation_data_path: Optional[str] = None,
 ) -> Tuple[bool, Optional[np.ndarray]]:
     """
-    尝试节点插入优化：检查是否可以使用四卡节点或八卡主机作为起点。
-    
-    :param global_mode: 如果为 True，使用全局带宽评估
-    :return: (success_insert, combo_result) 如果成功插入则返回 (True, combo)，否则返回 (False, None)
+    Try node-insertion optimization: see if a 4-GPU node or 8-GPU host can be the start.
+
+    :param global_mode: If True, use global bandwidth evaluation
+    :param global_mode_all: When global_mode=True and this is True, global score adds history + remaining
+    :return: (success_insert, combo_result)
     """
     success_insert = False
     best_gpu = np.zeros(num_dimensions, dtype=int)
     
-    # 检查四卡节点插入
+    # Check 4-GPU node insertion
     if gpu_need <= 4:
-        # 收集所有完全可用的 4 卡节点
+        # Collect all fully available 4-GPU nodes
         available_nodes = []
         for comp in complete_node_list:
             if set(comp).issubset(set(avail_gpu)):
@@ -349,7 +320,11 @@ def _try_node_insert_optimization(
                     temp_gpu = np.zeros(num_dimensions, dtype=int)
                     temp_gpu[node] = 1
                     bw_value, _, _ = calculate_bandwidth_values(
-                        temp_gpu, total_gpu, gpu_bw_dict_list, switch_config, data_path
+                        temp_gpu,
+                        total_gpu,
+                        gpu_bw_dict_list,
+                        switch_config,
+                        _select_data_path_for_mode(True, training_data_path, evaluation_data_path),
                     )
                     if bw_value > max_bw:
                         max_bw = bw_value
@@ -365,19 +340,21 @@ def _try_node_insert_optimization(
                 total_gpu=total_gpu,
                 gpu_bw_dict_list=gpu_bw_dict_list,
                 switch_config=switch_config,
-                data_path=data_path,
+                training_data_path=training_data_path,
                 device=device,
                 artifact_dir=artifact_dir,
                 if_real_data=if_real_data,
                 cluster_manager=cluster_manager,
                 global_mode=global_mode,
                 avail_gpu=avail_gpu,
+                global_mode_all=global_mode_all,
+                evaluation_data_path=evaluation_data_path,
             )
             return (True, combo_result)
     
-    # 检查八卡主机插入
+
     if gpu_need <= 8 and not success_insert:
-        # 收集所有完全可用的 8 卡整机
+        # Collect all fully available 8-GPU hosts
         available_hosts = []
         for comp in complete_host_list:
             if set(comp).issubset(set(avail_gpu)):
@@ -392,7 +369,11 @@ def _try_node_insert_optimization(
                     temp_gpu = np.zeros(num_dimensions, dtype=int)
                     temp_gpu[host] = 1
                     bw_value, _, _ = calculate_bandwidth_values(
-                        temp_gpu, total_gpu, gpu_bw_dict_list, switch_config, data_path
+                        temp_gpu,
+                        total_gpu,
+                        gpu_bw_dict_list,
+                        switch_config,
+                        _select_data_path_for_mode(True, training_data_path, evaluation_data_path),
                     )
                     if bw_value > max_bw:
                         max_bw = bw_value
@@ -408,13 +389,15 @@ def _try_node_insert_optimization(
                 total_gpu=total_gpu,
                 gpu_bw_dict_list=gpu_bw_dict_list,
                 switch_config=switch_config,
-                data_path=data_path,
+                training_data_path=training_data_path,
                 device=device,
                 artifact_dir=artifact_dir,
                 if_real_data=if_real_data,
                 cluster_manager=cluster_manager,
                 global_mode=global_mode,
                 avail_gpu=avail_gpu,
+                global_mode_all=global_mode_all,
+                evaluation_data_path=evaluation_data_path,
             )
             return (True, combo_result)
     
@@ -427,30 +410,32 @@ def _evaluate_bandwidth(
     total_gpu: int,
     gpu_bw_dict_list,
     switch_config: SwitchBandwidthConfig | float | None,
-    data_path: str,
+    training_data_path: str,
     device,
     artifact_dir: Path,
     if_real_data: bool,
     cluster_manager: Optional['ClusterStateManager'],
+    evaluation_data_path: Optional[str] = None,
 ) -> float:
     """
-    统一带宽评估函数：根据 cluster_manager 和 if_real_data 选择评估方法。
-    
-    :return: 带宽值
+    Unified bandwidth evaluation: select method based on cluster_manager / if_real_data.
+
+    :return: Bandwidth value
     """
     if cluster_manager:
-        # 首选在线预测，保证与调度器的一致性
+        # Prefer online prediction to stay aligned with scheduler
         return cluster_manager.predict_with_contention(combo)
     elif if_real_data:
-        # 真实数据路径：直接查表/插值得到带宽
+        # Real-data path: lookup/interpolate bandwidth
+        real_path = _select_data_path_for_mode(True, training_data_path, evaluation_data_path)
         bw_value, _, _ = calculate_bandwidth_values(
-            combo, total_gpu, gpu_bw_dict_list, switch_config, data_path
+            combo, total_gpu, gpu_bw_dict_list, switch_config, real_path
         )
         return bw_value
     else:
-        # 模型推理路径：单条配置也复用 prepare_model_inputs，避免重复代码
+        # Model inference path: reuse prepare_model_inputs even for single combo
         part_bws_list, node_counts_list, total_counts_list = prepare_model_inputs(
-            np.array([combo]), total_gpu, gpu_bw_dict_list, switch_config, data_path
+            np.array([combo]), total_gpu, gpu_bw_dict_list, switch_config, training_data_path
         )
         bw_value = predict_with_model(
             model, part_bws_list, node_counts_list, total_counts_list, device, artifact_dir
@@ -463,39 +448,40 @@ def _evaluate_global_bandwidth(
     avail_gpu: Sequence[int],
     num_dimensions: int,
     cluster_manager: Optional['ClusterStateManager'],
+    global_mode_all: bool = False,
 ) -> float:
     """
-    评估全局带宽：当前配置带宽 + 剩余可用GPU带宽。
-    
-    当 global=True 时，不仅评估当前配置的带宽，还评估采用当前配置后
-    剩余可用GPU的带宽，两者相加得到全局带宽。
-    
-    :param config: 当前GPU配置（0/1向量）
-    :param avail_gpu: 可用GPU列表
-    :param num_dimensions: GPU总数
-    :param cluster_manager: 集群状态管理器
-    :return: 全局带宽值（当前配置带宽 + 剩余GPU带宽）
+    Evaluate global bandwidth.
+
+    When global=True, evaluate current combo plus remaining GPUs.
+    When global_mode_all=True, also add already-allocated combos.
+
+    :param config: Current GPU combo (0/1)
+    :param avail_gpu: Available GPUs
+    :param num_dimensions: Total GPUs
+    :param cluster_manager: Cluster state manager
+    :return: Global bandwidth (with or without history based on global_mode_all)
     """
-    # 评估当前配置的带宽，反映已分配训练任务的收益
+    # Bandwidth for current combo (already-selected training job benefit)
     current_bw = cluster_manager.predict_with_contention(config)
     
-    # 计算剩余可用GPU（avail_gpu 中不在 config 中的 GPU）
+    # Remaining available GPUs (avail_gpu not in config)
     selected_gpus = set(np.where(config == 1)[0])
     remaining_gpus = [gpu for gpu in avail_gpu if gpu not in selected_gpus]
     
-    # 如果剩余GPU为空，只返回当前带宽
-    if not remaining_gpus:
-        return current_bw
-    
-    # 构造剩余GPU的配置向量（所有剩余GPU都选中）
-    remaining_config = np.zeros(num_dimensions, dtype=int)
-    remaining_config[remaining_gpus] = 1
-    
-    # 评估剩余GPU配置的带宽
-    remaining_bw = cluster_manager.predict_with_contention(remaining_config)
-    
-    # 返回两者之和
-    return current_bw + remaining_bw
+    remaining_bw = 0.0
+    if remaining_gpus:
+        # Build config for remaining GPUs (select all remaining)
+        remaining_config = np.zeros(num_dimensions, dtype=int)
+        remaining_config[remaining_gpus] = 1
+        # Evaluate bandwidth of remaining GPUs
+        remaining_bw = cluster_manager.predict_with_contention(remaining_config)
+
+    total_bw = current_bw + remaining_bw
+    if global_mode_all:
+        total_bw += cluster_manager.get_total_active_bandwidth()
+
+    return total_bw
 
 
 def _compare_and_select_best(
@@ -505,7 +491,7 @@ def _compare_and_select_best(
     total_gpu: int,
     gpu_bw_dict_list,
     switch_config: SwitchBandwidthConfig | float | None,
-    data_path: str,
+    training_data_path: str,
     device,
     artifact_dir: Path,
     if_real_data: bool,
@@ -514,19 +500,22 @@ def _compare_and_select_best(
     global_mode: bool = False,
     avail_gpu: Optional[Sequence[int]] = None,
     num_dimensions: Optional[int] = None,
+    global_mode_all: bool = False,
+    evaluation_data_path: Optional[str] = None,
 ) -> Optional[np.ndarray]:
     """
-    比较两种方法的结果，选择带宽更高的组合。
-    
-    :param combo_from_subtract: 从剔除方法得到的结果
-    :param combo_from_eha: 从EHA方法得到的结果
-    :param success_insert: 是否成功使用了节点插入（用于else分支的特殊处理）
-    :param global_mode: 如果为 True，使用全局带宽评估
-    :param avail_gpu: 可用GPU列表，global_mode=True 时需要提供
-    :param num_dimensions: GPU总数，global_mode=True 时需要提供
-    :return: 最优GPU组合
+    Compare two candidate combos and pick the higher-bandwidth one.
+
+    :param combo_from_subtract: Result from subtract path
+    :param combo_from_eha: Result from EHA path
+    :param success_insert: Whether node insertion succeeded (special handling for else)
+    :param global_mode: If True, use global bandwidth evaluation
+    :param avail_gpu: Available GPUs (required when global_mode=True)
+    :param num_dimensions: Total GPUs (required when global_mode=True)
+    :param global_mode_all: When global_mode=True and True here, global score includes history + remaining
+    :return: Best GPU combo
     """
-    # 处理 None 情况
+    # Handle None cases
     candidates: List[Tuple[str, np.ndarray]] = []
     if combo_from_eha is not None:
         candidates.append(("eha", combo_from_eha))
@@ -534,31 +523,38 @@ def _compare_and_select_best(
         candidates.append(("subtract", combo_from_subtract))
 
     if not candidates:
-        logger.warning("所有候选结果均为 None")
+        logger.warning("All candidate results are None")
         return None
 
     if len(candidates) == 1:
-        logger.warning("只有一个候选结果，直接返回")
+        logger.warning("Only one candidate; returning it")
         return candidates[0][1]
 
     if cluster_manager:
-        # 多租户模式下直接重用在线带宽评估
+        # In multi-tenant mode reuse online bandwidth evaluation
         if global_mode and avail_gpu is not None and num_dimensions is not None:
             bw_list = [
-                _evaluate_global_bandwidth(combo, avail_gpu, num_dimensions, cluster_manager)
+                _evaluate_global_bandwidth(
+                    combo,
+                    avail_gpu,
+                    num_dimensions,
+                    cluster_manager,
+                    global_mode_all=global_mode_all,
+                )
                 for _, combo in candidates
             ]
         else:
             bw_list = [cluster_manager.predict_with_contention(combo) for _, combo in candidates]
     elif if_real_data:
+        real_path = _select_data_path_for_mode(True, training_data_path, evaluation_data_path)
         bw_list = [
-            calculate_bandwidth_values(combo, total_gpu, gpu_bw_dict_list, switch_config, data_path)[0]
+            calculate_bandwidth_values(combo, total_gpu, gpu_bw_dict_list, switch_config, real_path)[0]
             for _, combo in candidates
         ]
     else:
         combo_array = np.array([combo for _, combo in candidates])
         part_bws_list, node_counts_list, total_counts_list = prepare_model_inputs(
-            combo_array, total_gpu, gpu_bw_dict_list, switch_config, data_path
+            combo_array, total_gpu, gpu_bw_dict_list, switch_config, training_data_path
         )
         bw_pred = predict_with_model(
             model, part_bws_list, node_counts_list, total_counts_list, device, artifact_dir
@@ -571,17 +567,18 @@ def _compare_and_select_best(
             bw_list = bw_pred
 
         if success_insert:
-            # 若经历了节点插入优化，需要用真实带宽修正 subtract 路径的得分
+            # After node insertion, adjust subtract-path score using real bandwidth
             for idx, (label, combo) in enumerate(candidates):
                 if label == "subtract":
+                    real_path = _select_data_path_for_mode(True, training_data_path, evaluation_data_path)
                     bw_list[idx], _, _ = calculate_bandwidth_values(
-                        combo, total_gpu, gpu_bw_dict_list, switch_config, data_path
+                        combo, total_gpu, gpu_bw_dict_list, switch_config, real_path
                     )
                     break
 
     max_idx = int(np.argmax(bw_list))
     if not if_real_data:
-        logger.info(f"预测的最优带宽为：{bw_list[max_idx]},选择的算法是：{candidates[max_idx][0]}")
+        logger.info(f"Predicted best bandwidth: {bw_list[max_idx]}, algorithm: {candidates[max_idx][0]}")
     return candidates[max_idx][1]
 
 
@@ -593,49 +590,52 @@ def improved_searching_algo(
     total_gpu: int,
     gpu_bw_dict_list,
     switch_config: SwitchBandwidthConfig | float | None,
-    data_path: str,
+    training_data_path: str,
     device,
     artifact_dir: Path,
     if_real_data: bool = False,
     cluster_manager: Optional['ClusterStateManager'] = None,
     global_mode: bool = False,
+    global_mode_all: bool = False,
+    evaluation_data_path: Optional[str] = None,
 ) -> Optional[np.ndarray]:
     """
-    改进的搜索算法：支持多租户感知的带宽预测。
-    
-    :param num_dimensions: GPU总数
-    :param avail_gpu: 可用GPU列表
-    :param model: 预测模型
-    :param gpu_need: 需要的GPU数量
-    :param total_gpu: 总GPU数
-    :param gpu_bw_dict_list: GPU带宽字典
-    :param switch_config: 交换机配置
-    :param data_path: 数据路径
-    :param device: 设备
-    :param artifact_dir: 模型目录
-    :param if_real_data: 是否使用真实数据
-    :param cluster_manager: 集群状态管理器（用于多租户感知）
-    :param global_mode: 如果为 True，使用全局带宽评估（当前配置带宽 + 剩余GPU带宽）
-    :return: 最优GPU组合
+    Improved search algorithm with multi-tenant-aware bandwidth prediction.
+
+    :param num_dimensions: Total GPUs
+    :param avail_gpu: Available GPU list
+    :param model: Prediction model
+    :param gpu_need: Required GPU count
+    :param total_gpu: Total GPUs
+    :param gpu_bw_dict_list: GPU bandwidth dictionaries
+    :param switch_config: Switch configuration
+    :param training_data_path: Data path for model prediction
+    :param device: Device
+    :param artifact_dir: Artifact directory
+    :param if_real_data: Use real data if True
+    :param cluster_manager: Cluster state manager (for multi-tenant awareness)
+    :param global_mode: If True, score with global bandwidth (current + remaining)
+    :param global_mode_all: If True with global_mode, add history + remaining to global score
+    :return: Best GPU combo
     """
     if len(avail_gpu) < gpu_need:
-        logger.warning("可用GPU数量小于需求数量")
+        logger.warning("Available GPUs are fewer than required")
         return None
 
     if len(avail_gpu) == gpu_need:
         return generate_data_minmax_restricted(
             1, num_dimensions, min_ones=len(avail_gpu), max_ones=len(avail_gpu), avail_gpu=avail_gpu
         )[0]
-    # 第一条路径：原有的从全部可用GPU开始剔除的方法
+    # Path 1: original subtract-from-all-available approach
     max_gpu_combo = generate_data_minmax_restricted(
         1, num_dimensions, min_ones=len(avail_gpu), max_ones=len(avail_gpu), avail_gpu=avail_gpu
     )[0]
 
-    # 准备节点和主机列表
+    # Prepare node and host lists
     complete_host_list = [[int(8 * i + e) for e in range(0, 8)] for i in range(0, int(num_dimensions / 8))]
     complete_node_list = [[int(4 * i + e) for e in range(0, 4)] for i in range(0, int(num_dimensions / 4))]
 
-    # 尝试节点插入优化：若存在整节点/整机可用，直接以其为起点显著减少搜索空间
+    # Try node insertion optimization: start from full node/host when available to shrink search space
     success_insert, combo_from_subtract = _try_node_insert_optimization(
         gpu_need=gpu_need,
         num_dimensions=num_dimensions,
@@ -647,15 +647,17 @@ def improved_searching_algo(
         total_gpu=total_gpu,
         gpu_bw_dict_list=gpu_bw_dict_list,
         switch_config=switch_config,
-        data_path=data_path,
+        training_data_path=training_data_path,
         device=device,
         artifact_dir=artifact_dir,
         if_real_data=if_real_data,
         cluster_manager=cluster_manager,
         global_mode=global_mode,
+        global_mode_all=global_mode_all,
+        evaluation_data_path=evaluation_data_path,
     )
 
-    # 如果没有成功使用节点插入，使用原始的方法
+
     if not success_insert:
         combo_from_subtract = greedy_recursive_search(
             current_combo=max_gpu_combo,
@@ -664,16 +666,18 @@ def improved_searching_algo(
             total_gpu=total_gpu,
             gpu_bw_dict_list=gpu_bw_dict_list,
             switch_config=switch_config,
-            data_path=data_path,
+            training_data_path=training_data_path,
             device=device,
             artifact_dir=artifact_dir,
             if_real_data=if_real_data,
             cluster_manager=cluster_manager,
             global_mode=global_mode,
             avail_gpu=avail_gpu,
+            global_mode_all=global_mode_all,
+            evaluation_data_path=evaluation_data_path,
         )
 
-    # 第二条路径：采用启发式算法
+    # Second search path: invoke the heuristic EHA algorithm as an alternative candidate generator.
     from algorithms.eha import eha_search
 
     combo_from_eha = eha_search(
@@ -684,15 +688,17 @@ def improved_searching_algo(
         total_gpu,
         gpu_bw_dict_list,
         switch_config,
-        data_path,
+        training_data_path,
         device,
         artifact_dir,
-        if_real_data=if_real_data,  # 修复：使用函数的 if_real_data 参数，而不是硬编码
+        if_real_data=if_real_data,  # Use function argument instead of hardcoding
         cluster_manager=cluster_manager,
         global_mode=global_mode,
+        global_mode_all=global_mode_all,
+        evaluation_data_path=evaluation_data_path,
     )
 
-    # 比较两种方法的结果，选择带宽更高的
+    # compare abd choose the best
     return _compare_and_select_best(
         combo_from_subtract=combo_from_subtract,
         combo_from_eha=combo_from_eha,
@@ -700,7 +706,7 @@ def improved_searching_algo(
         total_gpu=total_gpu,
         gpu_bw_dict_list=gpu_bw_dict_list,
         switch_config=switch_config,
-        data_path=data_path,
+        training_data_path=training_data_path,
         device=device,
         artifact_dir=artifact_dir,
         if_real_data=if_real_data,
@@ -709,5 +715,7 @@ def improved_searching_algo(
         global_mode=global_mode,
         avail_gpu=avail_gpu,
         num_dimensions=num_dimensions,
+        global_mode_all=global_mode_all,
+        evaluation_data_path=evaluation_data_path,
     )
 
