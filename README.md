@@ -11,7 +11,7 @@ This codebase accompanies the paper:
 
 > **[BandPilot: Towards Performance- and Contention-Aware GPU Dispatching in AI Clusters]**  
 > Kunming Zhang, Hanlong Liao, Junyu Xue, Deke Guo, and Guoming Tang
-> xxxxx , 20XX.  
+> xxxxx , 2026.  
 > [Paper link](https://arxiv.org/abs/XXXX.XXXXX) 
 
 ### Citation
@@ -19,11 +19,10 @@ This codebase accompanies the paper:
 If you find this repository useful in your research, please cite:
 
 ```bibtex
-@article{bandpilot20xx,
-  title   = {BandPilot: [Full Paper Title Here]},
-  author  = {[Author 1] and [Author 2] and [Author 3] and others},
-  journal = {IEEE Transactions on Parallel and Distributed Systems},
-  year    = {20XX},
+@article{bandpilot2026,
+  title   = {BandPilot: Towards Performance- and Contention-Aware GPU Dispatching in AI Clusters},
+  author  = {Kunming Zhang, Hanlong Liao, Junyu Xue, Deke Guo, and Guoming Tang},
+  year    = {2026},
 }
 ```
 
