@@ -1,9 +1,3 @@
-## BandPilot Refactored
-
-This directory is a modular refactor of the 3,885-line monolithic script `BandPilot/Auto_experiment_H100.py`, covering the full pipeline of GPU bandwidth modeling, search, and evaluation.
-
-It is intended as the official implementation for our TPDS paper on GPU bandwidth-aware dispatching and BandPilot.  
-Please adapt the paper information and BibTeX below to your final publication details.
 
 ## Paper
 
