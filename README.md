@@ -33,8 +33,8 @@ If you find this repository useful in your research, please cite:
 - **Deep learning framework**: PyTorch (version as specified in `requirements.txt`)
 - **OS**: Linux (the experiments in the paper were conducted on Linux-based clusters)
 - **Hardware**:
-  - H100 GPU cluster with multiple 8-GPU nodes for H100 experiments
-  - Heterogeneous 4-node Het-4Mix cluster (4090 / A800 / A6000 / V100, each with 8 GPUs) for heterogeneous experiments
+  - H100 GPU cluster with 4*8 GPU for H100 experiments
+  - Heterogeneous 4-node (Het-4Mix) cluster (4090 / A800 / A6000 / V100, each with 8 GPUs) for heterogeneous experiments
 
 We strongly recommend creating a fresh virtual environment and installing dependencies via:
 
