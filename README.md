@@ -191,10 +191,9 @@ You can create additional YAML configs (e.g., variants of `default_config.yaml`)
 ## License
 
 This project is currently intended for academic research use.  
-We recommend adding an explicit open-source license file (e.g., MIT, Apache-2.0, or BSD-3-Clause) at the repository root and updating this section accordingly.
 
 ## Contact
 
 For questions, feedback, or collaboration, please contact the corresponding author(s):  
-`[your.name]@institution.edu`  <!-- TODO: replace with actual contact email -->
+`kzhang519@connect.hkust-gz.edu.cn`  
 
