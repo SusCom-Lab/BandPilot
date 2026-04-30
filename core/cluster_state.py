@@ -4,6 +4,7 @@ Implements resource allocation, contention detection, and bandwidth prediction f
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 import numpy as np
 import copy
 import logging
@@ -13,8 +14,12 @@ from contextvars import ContextVar
 from typing import List, Dict, Tuple, Optional, Set, Callable
 from pathlib import Path
 
-from core.bandwidth import prepare_model_inputs, calculate_bandwidth_values, SwitchBandwidthConfig
+from core.bandwidth import prepare_model_inputs, calculate_bandwidth_values, config_to_bandwidth, SwitchBandwidthConfig
 from training.evaluator import predict_with_model
+
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from algorithms.cache import SuperComboCache
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +144,256 @@ def create_bandwidth_predictor(
         
         return predictor
 
+
+def create_bandwidth_predictor_batch(
+    if_real_data: bool,
+    total_gpu: int,
+    gpu_bw_dict_list: List,
+    switch_config: SwitchBandwidthConfig,
+    training_data_path: str,
+    evaluation_data_path: Optional[str] = None,
+    model=None,
+    device=None,
+    artifact_dir: Optional[Path] = None,
+    num_train_samples: Optional[int] = None,
+) -> Callable[[np.ndarray], np.ndarray]:
+    """Factory that creates a batch bandwidth predictor callable.
+
+    Companion to create_bandwidth_predictor; returns a callable that accepts a 2D
+    array of GPU combos and returns a 1D array of predicted bandwidths in a single
+    forward pass, avoiding per-combo Python overhead.
+
+    Args:
+        (Same as create_bandwidth_predictor.)
+
+    Returns:
+        Callable taking np.ndarray (N, total_gpu) and returning np.ndarray (N,).
+    """
+    real_data_path = evaluation_data_path or training_data_path
+
+    if if_real_data:
+        def batch_predictor(combos: np.ndarray) -> np.ndarray:
+            combos = np.asarray(combos)
+            if combos.ndim == 1:
+                combos = combos.reshape(1, -1)
+            if len(combos) == 0:
+                return np.array([], dtype=float)
+            bw_array, _ = config_to_bandwidth(
+                combos, total_gpu, gpu_bw_dict_list, switch_config, real_data_path
+            )
+            return bw_array.astype(float)
+
+        return batch_predictor
+    else:
+        if model is None or device is None or artifact_dir is None:
+            raise ValueError(
+                "Model prediction mode requires model, device and artifact_dir."
+            )
+
+        def batch_predictor(combos: np.ndarray) -> np.ndarray:
+            combos = np.asarray(combos)
+            if combos.ndim == 1:
+                combos = combos.reshape(1, -1)
+            if len(combos) == 0:
+                return np.array([], dtype=float)
+            # Filter out zero-sum combos (no GPUs selected) to avoid unnecessary inference
+            sums = combos.sum(axis=1)
+            results = np.zeros(len(combos), dtype=float)
+            non_zero_mask = sums > 0
+            if not np.any(non_zero_mask):
+                return results
+            non_zero_combos = combos[non_zero_mask]
+            part_bws, node_counts, total_counts = prepare_model_inputs(
+                non_zero_combos, total_gpu, gpu_bw_dict_list,
+                switch_config, training_data_path,
+            )
+            preds = predict_with_model(
+                model, part_bws, node_counts, total_counts,
+                device, artifact_dir, num_train_samples,
+            )
+            results[non_zero_mask] = np.asarray(preds, dtype=float).reshape(-1)
+            return results
+
+        return batch_predictor
+
+
+@dataclass(frozen=True)
+class SharedResourceCompatibilityScore:
+    """Shared-resource compatibility summary for network-aware baselines.
+
+    The score exposes a candidate's shared-node overlap, admitted bandwidth,
+    and compatibility margin so baselines can rerank placements without
+    mutating the live `ClusterStateManager`.
+    """
+
+    shared_node_count: int
+    candidate_standalone_bw: float
+    candidate_demand_bw: float
+    background_demand_bw: float
+    dual_capacity_bw: float
+    admitted_candidate_bw: float
+    compatibility_margin: float
+    feasible: bool
+
+
+class SharedResourceCompatibilityScorer:
+    """Compatibility scorer backed by `ClusterStateManager` contention logic.
+
+    This is a scheduling-level proxy rather than a link-level affinity graph.
+    It evaluates shared-node and dual-super-combo bottlenecks for baseline
+    reranking while preserving the manager's contention semantics.
+    """
+
+    def __init__(self, manager: "ClusterStateManager") -> None:
+        self._manager = manager
+        self._standalone_cache: Dict[str, float] = {}
+        self._dual_capacity_cache: Dict[Tuple[str, str], Optional[float]] = {}
+
+    @staticmethod
+    def _combo_signature(combo: np.ndarray) -> str:
+        combo_arr = np.asarray(combo, dtype=int)
+        return ",".join(str(int(idx)) for idx in np.where(combo_arr == 1)[0].tolist())
+
+    def _predict_standalone(self, combo: np.ndarray) -> float:
+        signature = self._combo_signature(combo)
+        cached = self._standalone_cache.get(signature)
+        if cached is not None:
+            return float(cached)
+        combo_arr = self._manager._validate_combo_request(combo, enforce_availability=False)
+        bw_value = float(self._manager._predict_combo_bandwidth(combo_arr))
+        self._standalone_cache[signature] = bw_value
+        return bw_value
+
+    def _dual_capacity(
+        self,
+        candidate_combo: np.ndarray,
+        candidate_nodes: Set[int],
+        background_combo: np.ndarray,
+        background_nodes: Set[int],
+    ) -> Optional[float]:
+        candidate_signature = self._combo_signature(candidate_combo)
+        background_signature = self._combo_signature(background_combo)
+        key = tuple(sorted((candidate_signature, background_signature)))
+        if key in self._dual_capacity_cache:
+            cached = self._dual_capacity_cache[key]
+            return None if cached is None else float(cached)
+        dual_capacity = self._manager._calculate_dual_super_combo_capacity(
+            candidate_combo,
+            candidate_nodes,
+            background_combo,
+            background_nodes,
+        )
+        self._dual_capacity_cache[key] = None if dual_capacity is None else float(dual_capacity)
+        return None if dual_capacity is None else float(dual_capacity)
+
+    def _resolve_primary_background_job(self) -> Optional[Dict]:
+        if not self._manager.active_jobs:
+            return None
+        for job in self._manager.active_jobs:
+            if int(job.get("job_id", -999999)) == -1:
+                return job
+        return self._manager.active_jobs[0]
+
+    def score_candidate(self, candidate_combo: np.ndarray) -> SharedResourceCompatibilityScore:
+        """Score candidate compatibility with the current background job.
+
+        Idle mode has no background contention and returns standalone behavior.
+        Otherwise the score penalizes shared-node clashes and marks infeasible
+        super-combos when the candidate plus background cannot be evaluated.
+        """
+
+        candidate_arr = self._manager._validate_combo_request(
+            candidate_combo,
+            enforce_availability=False,
+        )
+        candidate_standalone = self._predict_standalone(candidate_arr)
+        candidate_demand = float(candidate_standalone)
+
+        if not self._manager._should_apply_contention():
+            return SharedResourceCompatibilityScore(
+                shared_node_count=0,
+                candidate_standalone_bw=candidate_standalone,
+                candidate_demand_bw=candidate_demand,
+                background_demand_bw=0.0,
+                dual_capacity_bw=float("inf"),
+                admitted_candidate_bw=candidate_standalone,
+                compatibility_margin=float("inf"),
+                feasible=True,
+            )
+
+        background_job = self._resolve_primary_background_job()
+        if background_job is None:
+            return SharedResourceCompatibilityScore(
+                shared_node_count=0,
+                candidate_standalone_bw=candidate_standalone,
+                candidate_demand_bw=candidate_demand,
+                background_demand_bw=0.0,
+                dual_capacity_bw=float("inf"),
+                admitted_candidate_bw=candidate_standalone,
+                compatibility_margin=float("inf"),
+                feasible=True,
+            )
+
+        background_combo = self._manager._validate_combo_request(
+            background_job["combo"],
+            enforce_availability=False,
+        )
+        candidate_nodes = self._manager._get_nodes_for_combo(candidate_arr)
+        background_nodes = self._manager._get_nodes_for_combo(background_combo)
+        shared_nodes = candidate_nodes & background_nodes
+        shared_node_count = int(len(shared_nodes))
+        background_demand = float(self._manager._get_job_demand(background_job))
+
+        if shared_node_count == 0:
+            return SharedResourceCompatibilityScore(
+                shared_node_count=0,
+                candidate_standalone_bw=candidate_standalone,
+                candidate_demand_bw=candidate_demand,
+                background_demand_bw=background_demand,
+                dual_capacity_bw=float("inf"),
+                admitted_candidate_bw=candidate_standalone,
+                compatibility_margin=float("inf"),
+                feasible=True,
+            )
+
+        dual_capacity = self._dual_capacity(
+            candidate_arr,
+            candidate_nodes,
+            background_combo,
+            background_nodes,
+        )
+        if dual_capacity is None:
+            return SharedResourceCompatibilityScore(
+                shared_node_count=shared_node_count,
+                candidate_standalone_bw=candidate_standalone,
+                candidate_demand_bw=candidate_demand,
+                background_demand_bw=background_demand,
+                dual_capacity_bw=0.0,
+                admitted_candidate_bw=0.0,
+                compatibility_margin=float("-inf"),
+                feasible=False,
+            )
+
+        total_demand = float(candidate_demand + background_demand)
+        if total_demand <= float(dual_capacity):
+            admitted_candidate_bw = float(candidate_standalone)
+        else:
+            admitted_candidate_bw = min(
+                float(candidate_standalone),
+                float(dual_capacity) * float(candidate_demand) / float(total_demand),
+            )
+        return SharedResourceCompatibilityScore(
+            shared_node_count=shared_node_count,
+            candidate_standalone_bw=candidate_standalone,
+            candidate_demand_bw=candidate_demand,
+            background_demand_bw=background_demand,
+            dual_capacity_bw=float(dual_capacity),
+            admitted_candidate_bw=float(admitted_candidate_bw),
+            compatibility_margin=float(dual_capacity) - float(total_demand),
+            feasible=True,
+        )
+
+
 class ClusterStateManager:
     """Cluster state manager for multi-tenant GPU allocation and contention.
 
@@ -148,7 +403,7 @@ class ClusterStateManager:
     - Use create_bandwidth_predictor() to ensure consistent predictors.
     - contention_mode controls contention modeling:
         - "intensive" (default): cross-node tasks assumed at peak; split by bottleneck capacity.
-        - "common": simulates moderate usage (25%–75% peak) for allocated jobs; new job modeled at peak.
+        - "common": simulates moderate usage (25%-75% peak) for allocated jobs; new job modeled at peak.
         - "idle": no contention; always exclusive bandwidth.
 
     Example:
@@ -163,7 +418,22 @@ class ClusterStateManager:
             device=device,
             artifact_dir=artifact_dir,
         )
-        manager = ClusterStateManager(total_gpu=32, bandwidth_predictor=predictor)
+        predictor_batch = create_bandwidth_predictor_batch(
+            if_real_data=False,
+            total_gpu=32,
+            gpu_bw_dict_list=gpu_bw_dict_list,
+            switch_config=switch_config,
+            training_data_path="train_data.csv",
+            evaluation_data_path="eval_data.csv",
+            model=model,
+            device=device,
+            artifact_dir=artifact_dir,
+        )
+        manager = ClusterStateManager(
+            total_gpu=32,
+            bandwidth_predictor=predictor,
+            bandwidth_predictor_batch=predictor_batch,
+        )
     """
     
     def __init__(
@@ -172,6 +442,7 @@ class ClusterStateManager:
         bandwidth_predictor: Callable[[np.ndarray], float],
         contention_mode: str = "intensive",
         occupancy_seed: Optional[int] = None,
+        bandwidth_predictor_batch: Optional[Callable[[np.ndarray], np.ndarray]] = None,
     ):
         """Initialize cluster state manager.
 
@@ -180,24 +451,22 @@ class ClusterStateManager:
             bandwidth_predictor: Callable taking np.ndarray combo -> float bandwidth.
             contention_mode: Contention mode; "intensive" always considers cross-node contention,
                 "idle" skips contention (exclusive bandwidth).
+            bandwidth_predictor_batch: Optional batch predictor (np.ndarray (N, total_gpu) -> np.ndarray (N,)).
+                When provided, enables vectorized bandwidth prediction inside predict_with_contention_batch.
+                If None, falls back to looping over the single predictor.
         """
         contention_mode = normalize_contention_mode(contention_mode)
         self.total_gpu = total_gpu
         self.bandwidth_predictor = bandwidth_predictor
+        self.bandwidth_predictor_batch = bandwidth_predictor_batch
         self.contention_mode = contention_mode
 
         # 0: idle, 1: busy
         self.allocated_gpu_mask = np.zeros(total_gpu, dtype=int)
         
-        # Active job info
-        # Format: {
-        #   'job_id': int,
-        #   'combo': np.array,
-        #   'standalone_bw': float,  # peak bandwidth when exclusive
-        #   'occupancy_bw': float,   # real-time occupancy in common mode (else same as standalone)
-        #   'current_bw': float,     # bandwidth after contention
-        #   'history': List[float]   # bandwidth history
-        # }
+        # Active job records store job_id, combo, standalone bandwidth,
+        # occupancy-adjusted bandwidth, contention-adjusted bandwidth, and
+        # the bandwidth history used by replay and diagnostics.
         self.active_jobs: List[Dict] = []
         
         # Node size (assume 8 GPUs per node)
@@ -207,6 +476,9 @@ class ClusterStateManager:
         self._occupancy_seed = occupancy_seed if occupancy_seed is not None else 0
         self._occupancy_ratio_cache: Dict[int, float] = {}
         self._current_job_context: Optional[int] = None
+
+        # Optional dispatch-scoped super combo cache (C0)
+        self._super_combo_cache: Optional['SuperComboCache'] = None
 
     def _should_apply_contention(self) -> bool:
         """Whether contention logic should apply."""
@@ -234,7 +506,7 @@ class ClusterStateManager:
         return standalone_bw
 
     def _get_job_demand(self, job: Dict) -> float:
-        """Get a job’s demand bandwidth under the current mode."""
+        """Get a job's demand bandwidth under the current mode."""
         if self._is_common_mode():
             return job.get("occupancy_bw", job["standalone_bw"])
         return job["standalone_bw"]
@@ -286,6 +558,14 @@ class ClusterStateManager:
         """Return the total bandwidth of all active tasks."""
         return float(sum(job['current_bw'] for job in self.active_jobs))
 
+    def set_super_combo_cache(self, cache: Optional['SuperComboCache']) -> None:
+        """Attach a dispatch-scoped C0 cache for canonical super combo lookups."""
+        self._super_combo_cache = cache
+
+    def clear_super_combo_cache(self) -> None:
+        """Detach the C0 cache (end of dispatch)."""
+        self._super_combo_cache = None
+
     def set_job_context(self, job_id: Optional[int]) -> None:
         """Set the current evaluation job_id for predict_with_contention."""
         self._current_job_context = job_id
@@ -316,6 +596,7 @@ class ClusterStateManager:
         """Predict bandwidth for a combo (ignores external contention).
 
         Uses injected bandwidth_predictor so ClusterStateManager stays mode-agnostic.
+        When a C0 super combo cache is attached, looks up / stores results there.
 
         Args:
             combo: GPU combo (0/1 vector)
@@ -323,7 +604,71 @@ class ClusterStateManager:
         Returns:
             Predicted bandwidth.
         """
-        return int(self.bandwidth_predictor(combo))
+        cache = self._super_combo_cache
+        if cache is not None:
+            cached = cache.get(combo)
+            if cached is not None:
+                return cached
+        bw = int(self.bandwidth_predictor(combo))
+        if cache is not None:
+            cache.put(combo, bw)
+        return bw
+
+    def _predict_combo_bandwidth_batch(self, combos: np.ndarray) -> np.ndarray:
+        """Batch predict bandwidth for multiple combos (ignores external contention).
+
+        Uses bandwidth_predictor_batch when available (true batch: single forward pass),
+        otherwise falls back to looping over the single predictor.
+        When a C0 cache is attached, serves hits from cache and only predicts misses.
+
+        Args:
+            combos: 2D array (N, total_gpu), each row a 0/1 combo.
+
+        Returns:
+            1D float array (N,) of predicted bandwidths.
+        """
+        combos = np.asarray(combos)
+        if combos.ndim == 1:
+            combos = combos.reshape(1, -1)
+        n = len(combos)
+        if n == 0:
+            return np.array([], dtype=float)
+
+        cache = self._super_combo_cache
+
+        # --- Fast path: no cache ---
+        if cache is None:
+            if self.bandwidth_predictor_batch is not None:
+                raw_preds = self.bandwidth_predictor_batch(combos)
+                return np.asarray(raw_preds, dtype=float).astype(int).astype(float)
+            results = np.empty(n, dtype=float)
+            for i in range(n):
+                results[i] = self._predict_combo_bandwidth(combos[i])
+            return results
+
+        # --- Cache-aware path: partition hits/misses, deduplicate misses ---
+        hit_mask, cached_results, unique_miss_idx, miss_inverse = cache.get_batch(combos)
+        results = cached_results.copy()
+
+        if len(unique_miss_idx) == 0:
+            return results
+
+        miss_combos = combos[unique_miss_idx]
+        if self.bandwidth_predictor_batch is not None:
+            raw_preds = self.bandwidth_predictor_batch(miss_combos)
+            miss_bws = np.asarray(raw_preds, dtype=float).astype(int).astype(float)
+        else:
+            miss_bws = np.empty(len(miss_combos), dtype=float)
+            for i in range(len(miss_combos)):
+                miss_bws[i] = int(self.bandwidth_predictor(miss_combos[i]))
+
+        # Store predictions in cache
+        cache.put_batch(miss_combos, miss_bws)
+
+        miss_positions = np.where(~hit_mask)[0]
+        results[miss_positions] = miss_bws[miss_inverse[miss_positions]]
+
+        return results
 
     def _is_cross_node_combo(self, combo: np.ndarray) -> bool:
         """Check whether a GPU combo spans multiple nodes.
@@ -422,7 +767,7 @@ class ClusterStateManager:
             in either direction exceeds the per-node capacity on any node (indicating that the GPU
             combination is physically infeasible for parallel execution, and the caller should skip it)
         """
-        # From combo1’s perspective: combo1 + project(combo2, nodes1)
+        # From combo1's perspective: combo1 + project(combo2, nodes1)
         projection1 = self._project_combo_to_nodes(combo2, nodes1)
         super_combo1 = combo1 + projection1
         if not self._is_super_combo_feasible(super_combo1):
@@ -430,7 +775,7 @@ class ClusterStateManager:
         canonical_super_combo1 = self._canonicalize_combo(super_combo1)
         capacity1 = self._predict_combo_bandwidth(canonical_super_combo1)
         
-        # From combo2’s perspective: combo2 + project(combo1, nodes2)
+        # From combo2's perspective: combo2 + project(combo1, nodes2)
         projection2 = self._project_combo_to_nodes(combo1, nodes2)
         super_combo2 = combo2 + projection2
         if not self._is_super_combo_feasible(super_combo2):
@@ -550,6 +895,153 @@ class ClusterStateManager:
                 ratio = candidate_demand / total_demand
                 allocated_bw = max_capacity * ratio
                 return min(candidate_standalone, allocated_bw)
+        finally:
+            if profiler is not None and start_time is not None:
+                profiler.add(time.perf_counter() - start_time)
+
+    def predict_with_contention_batch(
+        self,
+        candidate_combos: np.ndarray,
+        job_id: Optional[int] = None,
+    ) -> np.ndarray:
+        """Vectorized batch version of predict_with_contention.
+
+        Evaluates N candidate combos with only two batch bandwidth predictions:
+        one for standalone BWs, one for all super combos needed by the contention model.
+        Per-combo Python overhead is limited to contention bookkeeping (demand comparison,
+        ratio allocation), which is cheap relative to model inference.
+
+        When bandwidth_predictor_batch is not set, this falls back to the loop-based
+        implementation so existing callers remain backward-compatible.
+
+        Args:
+            candidate_combos: 2D array of shape (N, total_gpu), each row a 0/1 combo.
+            job_id: Optional job_id for contention evaluation.
+
+        Returns:
+            1D numpy array of predicted bandwidths, length N.
+        """
+        profiler = _contention_profiler_ctx.get()
+        start_time = time.perf_counter() if profiler is not None else None
+        try:
+            combos = np.asarray(candidate_combos)
+            if combos.ndim == 1:
+                combos = combos.reshape(1, -1)
+            N = len(combos)
+            if N == 0:
+                return np.array([], dtype=float)
+
+            # Validate all combos
+            validated = np.empty_like(combos, dtype=int)
+            for i in range(N):
+                validated[i] = self._validate_combo_request(combos[i], enforce_availability=True)
+
+            resolved_job_id = self._resolve_job_id(job_id)
+
+            # --- Batch 1: predict standalone BWs for all candidates ---
+            standalone_bws = self._predict_combo_bandwidth_batch(validated)
+
+            if not self._should_apply_contention():
+                return standalone_bws
+
+            # Vectorically determine which candidates are cross-node
+            num_nodes = self.total_gpu // self.node_size
+            reshaped = validated.reshape(N, num_nodes, self.node_size)
+            node_has_gpu = reshaped.sum(axis=2) > 0           # (N, num_nodes)
+            nodes_per_combo = node_has_gpu.sum(axis=1)        # (N,)
+            is_cross_node = nodes_per_combo > 1               # (N,)
+
+            # Single-node combos: result = standalone_bw (no contention)
+            results = standalone_bws.copy()
+
+            cross_node_indices = np.where(is_cross_node)[0]
+            if len(cross_node_indices) == 0:
+                return results
+
+            # Precompute active cross-node jobs info (shared across all candidates)
+            cross_node_jobs: List[Tuple[Dict, set]] = []
+            for job in self.active_jobs:
+                if self._is_cross_node_combo(job['combo']):
+                    cross_node_jobs.append((job, self._get_nodes_for_combo(job['combo'])))
+
+            if not cross_node_jobs:
+                return results
+
+            # --- Collect all super combos needed for contention ---
+            # Each entry: (candidate_idx, job_idx, direction, super_combo_array)
+            super_combo_tasks: List[Tuple[int, int, int, np.ndarray]] = []
+
+            for ci in cross_node_indices:
+                candidate = validated[ci]
+                candidate_nodes = set(np.where(node_has_gpu[ci])[0])
+
+                for ji, (job, job_nodes) in enumerate(cross_node_jobs):
+                    if not (candidate_nodes & job_nodes):
+                        continue
+
+                    # Direction 1: candidate + project(job_combo, candidate_nodes)
+                    proj1 = self._project_combo_to_nodes(job['combo'], candidate_nodes)
+                    sc1 = candidate + proj1
+                    sc1_ok = self._is_super_combo_feasible(sc1)
+
+                    # Direction 2: job_combo + project(candidate, job_nodes)
+                    proj2 = self._project_combo_to_nodes(candidate, job_nodes)
+                    sc2 = job['combo'] + proj2
+                    sc2_ok = self._is_super_combo_feasible(sc2)
+
+                    # Both directions must be feasible for this pair to contribute
+                    if sc1_ok and sc2_ok:
+                        super_combo_tasks.append((ci, ji, 1, self._canonicalize_combo(sc1)))
+                        super_combo_tasks.append((ci, ji, 2, self._canonicalize_combo(sc2)))
+
+            if not super_combo_tasks:
+                return results
+
+            # --- Batch 2: predict all super combo capacities in one call ---
+            super_combos_array = np.array([t[3] for t in super_combo_tasks])
+            super_bws = self._predict_combo_bandwidth_batch(super_combos_array)
+
+            # Map results back to per-(candidate, job) pair capacities
+            pair_caps: Dict[Tuple[int, int], Dict[int, float]] = {}
+            for idx, (ci, ji, direction, _) in enumerate(super_combo_tasks):
+                key = (ci, ji)
+                if key not in pair_caps:
+                    pair_caps[key] = {}
+                pair_caps[key][direction] = float(super_bws[idx])
+
+            # --- Apply contention logic per cross-node candidate ---
+            for ci in cross_node_indices:
+                candidate_standalone = float(standalone_bws[ci])
+
+                if self._is_common_mode():
+                    candidate_demand = candidate_standalone
+                else:
+                    candidate_demand = self._derive_effective_demand(
+                        candidate_standalone, resolved_job_id
+                    )
+
+                dual_capacities: List[float] = []
+                existing_demands = 0.0
+
+                for ji, (job, job_nodes) in enumerate(cross_node_jobs):
+                    caps = pair_caps.get((ci, ji))
+                    if caps is None or 1 not in caps or 2 not in caps:
+                        continue
+                    dual_capacities.append(min(caps[1], caps[2]))
+                    existing_demands += self._get_job_demand(job)
+
+                if not dual_capacities:
+                    continue  # standalone already in results
+
+                max_capacity = min(dual_capacities)
+                total_demand = candidate_demand + existing_demands
+
+                if total_demand > max_capacity:
+                    ratio = candidate_demand / total_demand
+                    allocated_bw = max_capacity * ratio
+                    results[ci] = min(candidate_standalone, allocated_bw)
+
+            return results
         finally:
             if profiler is not None and start_time is not None:
                 profiler.add(time.perf_counter() - start_time)

@@ -7,7 +7,7 @@ import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -18,16 +18,52 @@ from utils.helpers import build_artifact_filename, read_active_num_train_samples
 
 logger = logging.getLogger(__name__)
 
+_PREDICTION_ARTIFACT_KEYS = (
+    "resolved_num_train_samples",
+    "bw_scaler",
+    "total_scaler",
+    "y_scaler",
+)
+
+
+def compute_extra_metrics(preds: np.ndarray, targets: np.ndarray) -> dict:
+    """Compute R^2, MAPE (%), RMSE, MSE, MAE from prediction/target arrays.
+
+    Returns dict with keys: r2, mape_percent, rmse, mse, mae.
+    """
+    errors = preds - targets
+    mse = float(np.mean(errors ** 2))
+    mae = float(np.mean(np.abs(errors)))
+    rmse = float(np.sqrt(mse))
+    denom = np.clip(np.abs(targets), 1e-6, None)
+    mape = float(np.mean(np.abs(errors) / denom) * 100.0)
+    ss_res = float(np.sum(errors ** 2))
+    ss_tot = float(np.sum((targets - np.mean(targets)) ** 2))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+    return {
+        "mse": mse,
+        "mae": mae,
+        "rmse": rmse,
+        "mape_percent": mape,
+        "r2": r2,
+    }
+
+
 class PredictionProfiler:
     """Simple accumulator to record predict_with_model latency."""
 
-    __slots__ = ("total_time",)
+    __slots__ = ("total_time", "call_count", "sample_count")
 
     def __init__(self) -> None:
         self.total_time: float = 0.0
 
-    def add(self, duration: float) -> None:
+        self.call_count: int = 0
+        self.sample_count: int = 0
+
+    def add(self, duration: float, sample_count: int = 1) -> None:
         self.total_time += duration
+        self.call_count += 1
+        self.sample_count += int(sample_count)
 
 
 _prediction_profiler_ctx: ContextVar[Optional[PredictionProfiler]] = ContextVar(
@@ -49,6 +85,28 @@ def prediction_profiling_session():
 def _load_scaler(path: Path):
     with path.open("rb") as f:
         return pickle.load(f)
+
+
+def _load_prediction_artifact_bundle(
+    artifact_dir: Path, resolved_num_train_samples: int
+) -> Dict[str, Any]:
+    return {
+        "resolved_num_train_samples": int(resolved_num_train_samples),
+        "bw_scaler": _load_scaler(
+            artifact_dir
+            / build_artifact_filename("bw_scaler", resolved_num_train_samples, ".pkl")
+        ),
+        "total_scaler": _load_scaler(
+            artifact_dir
+            / build_artifact_filename(
+                "total_counts_scaler", resolved_num_train_samples, ".pkl"
+            )
+        ),
+        "y_scaler": _load_scaler(
+            artifact_dir
+            / build_artifact_filename("y_scaler", resolved_num_train_samples, ".pkl")
+        ),
+    }
 
 
 def _ensure_num_train_samples(artifact_dir: Path, num_train_samples: Optional[int]) -> int:
@@ -95,6 +153,44 @@ def _ensure_num_train_samples(artifact_dir: Path, num_train_samples: Optional[in
     )
 
 
+def preload_prediction_artifacts(
+    artifact_dir: Path,
+    num_train_samples: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Load reusable predictor artifacts once for repeated inference calls."""
+    resolved_num_train_samples = _ensure_num_train_samples(
+        artifact_dir, num_train_samples
+    )
+    return _load_prediction_artifact_bundle(
+        artifact_dir, resolved_num_train_samples
+    )
+
+
+def _resolve_preloaded_prediction_artifacts(
+    preloaded_artifacts: Dict[str, Any],
+    num_train_samples: Optional[int],
+) -> Dict[str, Any]:
+    missing_keys = [
+        key for key in _PREDICTION_ARTIFACT_KEYS if key not in preloaded_artifacts
+    ]
+    if missing_keys:
+        raise KeyError(
+            "preloaded_artifacts missing keys: " + ", ".join(sorted(missing_keys))
+        )
+    resolved_num_train_samples = int(
+        preloaded_artifacts["resolved_num_train_samples"]
+    )
+    if (
+        num_train_samples is not None
+        and int(num_train_samples) != resolved_num_train_samples
+    ):
+        raise ValueError(
+            "num_train_samples does not match preloaded_artifacts "
+            f"({num_train_samples} != {resolved_num_train_samples})"
+        )
+    return preloaded_artifacts
+
+
 def predict_with_model(
     model,
     part_bws: np.ndarray,
@@ -103,12 +199,17 @@ def predict_with_model(
     device: torch.device,
     artifact_dir: Path,
     num_train_samples: Optional[int] = None,
+    preloaded_artifacts: Optional[Dict[str, Any]] = None,
 ) -> np.ndarray:
     """Predict bandwidth for multi-node configurations; single-node cases fall back to local bandwidth."""
     profiler = _prediction_profiler_ctx.get()
     start_time = time.perf_counter() if profiler is not None else None
-    resolved_num_train_samples = _ensure_num_train_samples(
-        artifact_dir, num_train_samples
+    loaded_artifacts = (
+        _resolve_preloaded_prediction_artifacts(
+            preloaded_artifacts, num_train_samples
+        )
+        if preloaded_artifacts is not None
+        else None
     )
     try:
         model.eval()
@@ -129,20 +230,15 @@ def predict_with_model(
                 multi_total_counts.append(total_counts[idx])
 
         if multi_part_bws:
-            bw_scaler = _load_scaler(
-                artifact_dir
-                / build_artifact_filename("bw_scaler", resolved_num_train_samples, ".pkl")
-            )
-            total_scaler = _load_scaler(
-                artifact_dir
-                / build_artifact_filename(
-                    "total_counts_scaler", resolved_num_train_samples, ".pkl"
+            if loaded_artifacts is None:
+                loaded_artifacts = preload_prediction_artifacts(
+                    artifact_dir,
+                    num_train_samples=num_train_samples,
                 )
-            )
-            y_scaler = _load_scaler(
-                artifact_dir
-                / build_artifact_filename("y_scaler", resolved_num_train_samples, ".pkl")
-            )
+
+            bw_scaler = loaded_artifacts["bw_scaler"]
+            total_scaler = loaded_artifacts["total_scaler"]
+            y_scaler = loaded_artifacts["y_scaler"]
 
             multi_part_bws_np = np.array(multi_part_bws)
             multi_node_counts_np = np.array(multi_node_counts)
@@ -165,7 +261,7 @@ def predict_with_model(
         return preds
     finally:
         if profiler is not None and start_time is not None:
-            profiler.add(time.perf_counter() - start_time)
+            profiler.add(time.perf_counter() - start_time, sample_count=len(part_bws))
 
 
 def evaluate_model(
@@ -307,4 +403,3 @@ def evaluate_simple_model(
     mse_avg = mse_total / total_samples
     mae_avg = mae_total / total_samples
     return mse_avg, mae_avg
-

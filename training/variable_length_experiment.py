@@ -3,7 +3,7 @@
 This script:
 1. Runs base training with 16-GPU / 24-GPU configs by reusing `trainer.model_train_pipeline`.
 2. Finetunes on 32-GPU real data after excluding GPU configs seen in the 16/24 datasets.
-3. Evaluates on the remaining 32-GPU samples and reports MAE/MAPE/MSE/RMSE/R².
+3. Evaluates on the remaining 32-GPU samples and reports MAE/MAPE/MSE/RMSE/R^2.
 4. Saves prediction-vs-target tables, model weights, and metric summaries for reproducibility.
 """
 from __future__ import annotations
@@ -143,7 +143,7 @@ def split_indices(
 
 
 def compute_extra_metrics(preds: np.ndarray, targets: np.ndarray) -> Dict[str, float]:
-    """Compute MAPE, RMSE, and R² in addition to MSE/MAE."""
+    """Compute MAPE, RMSE, and R^2 in addition to MSE/MAE."""
     errors = preds - targets
     mse = float(np.mean(errors**2))
     mae = float(np.mean(np.abs(errors)))

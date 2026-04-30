@@ -27,7 +27,7 @@ def slurm_best_fit_algo(
 ) -> np.ndarray:
     """Slurm-like best-fit strategy (improved: topology-aware across nodes).
 
-    Compactness is defined as “using as few nodes as possible”; under the same node count,
+    Compactness is defined as "using as few nodes as possible"; under the same node count,
     choose the GPU combo with best connectivity via topo_matrix/connectivity_score.
     """
     # Initialize result mask

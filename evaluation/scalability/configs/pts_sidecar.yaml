@@ -1,0 +1,54 @@
+# PTS scalability sidecar for answering one narrow reviewer-facing question:
+# "How much control-plane speedup does PTS achieve over legacy exact PTS
+#  when k=64 and scale grows to 128 / 256 / 512 GPUs?"
+#
+# Run:
+#   python evaluation/scalability/pts_sidecar/runner.py --config evaluation/scalability/configs/pts_sidecar.yaml
+#
+# Outputs are regenerated under evaluation/scalability/pts_sidecar/artifacts/.
+
+data:
+  h100_training_data_path: './Data/H100/Pune_H100_16M_binary.csv'
+  h100_evaluation_data_path: './Data/H100/Pune_H100_2GB_binary.csv'
+  bandwidth_dict_dir: './Data/Bandwidth'
+  model_save_dir: './model'
+
+model:
+  type: 'full'
+  hidden_dim: 32
+  num_layers: 6
+  num_heads: 8
+  dropout: 0.05
+  node_count_embedding_dim: 8
+
+training:
+  enable_training: false
+  num_train_samples: 250
+
+cluster:
+  total_gpu: 32
+  cluster_types:
+    - 'H100_26H100_27H100_28H100_29'
+    - 'Het-4Mix'
+
+evaluation:
+  pts_sidecar:
+    output_dir: './evaluation/scalability/pts_sidecar/artifacts'
+    hu_unit_gate:
+      aggressive: false
+    cluster_types:
+      - 'H100_26H100_27H100_28H100_29'
+      - 'Het-4Mix'
+    gpu_counts: [128, 256, 512]
+    k_value: 64
+    repeat_num: 10
+    contention_mode: 'common'
+    avail_ratio: 0.7
+    inter_pod_factor: 0.7
+    availability_mode: 'mixed'
+    save_every_n_records: 1
+    algorithms: ['legacy-PTS', 'PTS']
+    generate_report: true
+
+random_seed: 1111
+device: 'cuda'

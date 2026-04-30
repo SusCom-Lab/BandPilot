@@ -1,0 +1,94 @@
+# Isolated baseline-suite config.
+# This config intentionally lives under evaluation/baselines so the existing
+# default config remains untouched.
+
+random_seed: 1111
+device: "cuda"
+
+data:
+  bandwidth_dict_dir: "./Data/Bandwidth"
+  h100_training_data_path: "./Data/H100/Pune_H100_16M_binary.csv"
+  h100_evaluation_data_path: "./Data/H100/Pune_H100_2GB_binary.csv"
+
+bandpilot:
+  model_root: "./model"
+  evaluation_root: "./Data/Evaluation"
+
+model:
+  type: "full"
+  hidden_dim: 32
+  num_layers: 6
+  num_heads: 8
+  dropout: 0.05
+  node_count_embedding_dim: 8
+
+training:
+  num_train_samples: 250
+  num_test_samples: 2500
+  batch_size: 100
+  num_epochs: 300
+  learning_rate: 0.001
+  weight_decay: 0.00001
+  patience: 80
+  lambda_ewc: 2.0
+
+cluster:
+  total_gpu: 32
+  cluster_types:
+    - "H100_26H100_27H100_28H100_29"
+    - "Het-4Mix"
+  bw_switch: 1111
+
+max_bw_offline:
+  repeat_num: 50
+  if_dynamic: true
+  search_if_real_data: true
+  local_top_k: 10
+  max_combos_per_distribution: 2048
+  max_total_combos: 200000
+
+suite:
+  repeat_num: 50
+  if_dynamic: true
+  bw_type: "contention"
+  reference_algorithm: "BandPilot"
+  hu_unit_gate:
+    aggressive: false
+  contention_modes: ["idle", "common", "intensive"]
+  test_num_values: [4, 8, 12, 16, 20, 24, 28]
+  adaptive_runtime_policy:
+    mode: "adaptive_knn"
+    bank_partition_mode: "repeat"
+    top_k: 5
+    bootstrap_draws: 256
+    relative_noise_floor: 0.02
+    bw_improvement_threshold_pct_of_bandpilot: 0.5
+    k_neighbors: 5
+    same_contention_only: true
+    min_support: 5
+    low_trust_conflict_risk_threshold: 0.30
+    risk_threshold: 0.15
+    activation_criteria:
+      shadow_unsafe_skip_rate_pct_max: 0.0
+      shadow_over_trigger_rate_pct_max: 50.0
+      shadow_support_insufficient_case_count_max: 0
+      min_consecutive_pass_banks: 2
+      sticky_activation: true
+  algorithms:
+    - "BandPilot"
+    - "Topo"
+    - "Default"
+    - "Random"
+    - "CasCore"
+    - "BWGreedy"
+    - "LinearBW"
+  cascore_shortlist_limit: 12
+  cascore_extra_node_slack: 1
+  network_locality_penalty_weight: 0.35
+  bw_greedy_penalty_weight: 0.15
+
+outputs:
+  artifact_root: "./evaluation/baselines/artifacts"
+  report_root: "./evaluation/baselines/reports"
+  figure_root: "./evaluation/baselines/figures"
+  linear_model_root: "./evaluation/baselines/artifacts/models"

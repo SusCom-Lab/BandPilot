@@ -29,20 +29,20 @@ This directory encapsulates all low-level logic for **cluster bandwidth modeling
     - Only cross-node jobs interfere; single-node jobs do not contend with others.
     - Cross-node jobs use the full standalone bandwidth in contention calculations (not partial bandwidth).
     - Two cross-node jobs with shared nodes are considered contending.
-    - If a super combo in either direction exceeds 8 GPUs on any node, that GPU set is deemed non-concurrent and skipped—no canonicalization to “full”.
+    - If a super combo in either direction exceeds 8 GPUs on any node, that GPU set is deemed non-concurrent and skipped-no canonicalization to "full".
     - **Bidirectional super combo capacity**:
       - For candidate C and existing job J (sharing nodes), compute both directions:
-        - From C’s view: `super_C = C + project(J, nodes_of_C)`
-        - From J’s view: `super_J = J + project(C, nodes_of_J)`
+        - From C's view: `super_C = C + project(J, nodes_of_C)`
+        - From J's view: `super_J = J + project(C, nodes_of_J)`
       - Compute bandwidth for both and take the minimum: `capacity = min(f(super_C), f(super_J))`
       - If multiple related jobs exist, compute bidirectional capacity per pair; the bottleneck capacity is the minimum across pairs.
     - Total demand = candidate standalone bandwidth + demand of all related jobs:
-      - `contention_mode='common'`: allocated jobs use 25%–75% of peak as “actual occupied bandwidth”. The new job is modeled with peak bandwidth to ensure probe/commit `final_bw` reflects potential upper bound. This occupancy is sampled once at commit time and stored for future reads; the new job does not immediately lower its own demand in this contention round.
+      - `contention_mode='common'`: allocated jobs use 25%-75% of peak as "actual occupied bandwidth". The new job is modeled with peak bandwidth to ensure probe/commit `final_bw` reflects potential upper bound. This occupancy is sampled once at commit time and stored for future reads; the new job does not immediately lower its own demand in this contention round.
       - Other modes: all jobs use standalone bandwidth.
     - If total demand exceeds bottleneck capacity, bandwidth is proportionally split.
     - `predict_with_contention` and `allocate_job` stay symmetric: commit no longer pairs the new job with itself for super combos, only with other active jobs.
   - `predict_with_contention`: Probe API predicting bandwidth under contention.
-  - `allocate_job`: Commit API that allocates GPUs, updates state, and adjusts impacted jobs’ bandwidth.
+  - `allocate_job`: Commit API that allocates GPUs, updates state, and adjusts impacted jobs' bandwidth.
 
 ## Recommendations
 - Before reading real CSVs, ensure paths in `config/default_config.yaml` are correct.

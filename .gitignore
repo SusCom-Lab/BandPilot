@@ -1,6 +1,5 @@
-# Python
+# Python bytecode and build outputs
 __pycache__/
-__pycache__
 *.py[cod]
 *$py.class
 *.so
@@ -22,40 +21,65 @@ wheels/
 *.egg
 
 # Virtual environments
+.venv/
 venv/
 env/
 ENV/
-.venv
 conda/
 
-# IDE
-.vscode/
+# Local caches
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# IDE and OS metadata
 .idea/
+.vscode/
 .cursor/
 *.swp
 *.swo
 *~
 .DS_Store
+Thumbs.db
 
-# Jupyter Notebook
-.ipynb_checkpoints
+# Private agent and workspace state
+.claude/
+.codex/
+AGENTS.md
+status/
+research-log/
 
-
-
-# Logs
+# Logs and temporary files
 *.log
 logs/
-
-# Environment variables
+*.tmp
+*.temp
 .env
 .env.local
 
-# Temporary files
-*.tmp
-*.temp
-.cache/
+# Generated experiment data and model artifacts
+Data/Evaluation/
+Data/legacy_Evaluation/
+model/
+Models/
+evaluation/**/artifacts/
+evaluation/**/reports/
+evaluation/**/figures/
+evaluation/**/cache/
+algorithms/improvement/**/artifacts/
+algorithms/improvement/**/reports/
+algorithms/improvement/**/figures/
+algorithms/improvement/**/notes/
+algorithms/improvement/**/generated/
 
-# OS
-Thumbs.db
-.DS_Store
+# Generated paper/evaluation plots
+Figures/search_overhead*/
+Figures/Evaluation/**/*.csv
+Figures/Evaluation/**/*.png
+Figures/Evaluation/**/*.pdf
 
+# Large local installers and notebooks
+*.rpm
+Analysis.ipynb

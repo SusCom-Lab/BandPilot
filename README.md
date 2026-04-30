@@ -1,15 +1,75 @@
+# BandPilot
 
-## Paper
+This repository contains the public reproduction source for **BandPilot: Towards Performance- and Contention-Aware GPU Dispatching in AI Clusters**.
 
-This codebase accompanies the paper:
+The public tree is intentionally source-only. Generated experiment results, trained checkpoints, caches, internal revision logs, paper PDFs, and private workspace automation have been removed. The retained files are sufficient to inspect the implementation and rerun the reported workflows with the provided input data and configuration templates.
 
-> **[BandPilot: Towards Performance- and Contention-Aware GPU Dispatching in AI Clusters]**  
-> Kunming Zhang, Hanlong Liao, Junyu Xue, Deke Guo, and Guoming Tang
-> [Paper link](https://arxiv.org/abs/2506.15595) 
+## Repository Layout
 
-### Citation
+```text
+.
+├── main.py                  # Main training and evaluation entry point
+├── config/                  # Runtime configuration templates
+├── core/                    # Bandwidth lookup, topology, GPU config, cluster state
+├── models/                  # Bandwidth predictor model definitions
+├── data_process/            # Dataset generation and preprocessing helpers
+├── algorithms/              # BandPilot, PTS, EHA, Slurm-style, and baseline search logic
+├── training/                # Training, evaluation, and sensitivity experiment drivers
+├── evaluation/              # Reproduction scripts for comparisons, baselines, scalability, and sidecars
+├── Figures/Evaluation/      # Plotting source for regenerated evaluation figures
+├── Data/                    # Lightweight source inputs: bandwidth dictionaries, H100 CSVs, topology files
+└── requirements.txt         # Python dependency list
+```
 
-If you find this repository useful in your research, please cite:
+The following paths are generated locally and are excluded from the public source tree:
+
+- `Data/Evaluation/` and `Data/legacy_Evaluation/` for evaluation CSV outputs.
+- `model/` or `Models/` for checkpoints and scalers.
+- `evaluation/**/artifacts/`, `evaluation/**/reports/`, `evaluation/**/figures/`, and `evaluation/**/cache/`.
+- `Figures/search_overhead*/` and generated figure files under `Figures/Evaluation/`.
+
+## Environment
+
+Use Python 3.8 or newer on Linux. The implementation depends on PyTorch, NumPy, pandas, scikit-learn, matplotlib, and PyYAML; install the pinned project dependencies with:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+GPU-dependent workflows require an environment compatible with the target cluster and PyTorch build. CPU-only syntax checks and report generation can be run without GPU access.
+
+## Quick Start
+
+Run the default training and single-contention evaluation workflow:
+
+```bash
+python main.py --config config/default_config.yaml
+```
+
+The default config reads source inputs from `Data/H100`, `Data/Bandwidth`, and `Data/Topology`. It writes regenerated checkpoints and evaluation results to ignored output directories, so a clean public checkout remains source-only after results are removed.
+
+## Main Reproduction Workflows
+
+Use `config/default_config.yaml` for the main H100 and Het-4Mix training/evaluation pipeline. It controls data paths, model hyperparameters, training sample budgets, cluster topology, contention modes, offline `MaxBW_*` cache generation, and single-contention evaluation.
+
+In the single-contention workflow, the public `BandPilot` row is the current
+`search.py` mainline path: EHA candidate pruning, runtime kNN PTS gating, and
+current PTS refinement. The old exact-PTS BandPilot path is labeled
+`legacy-BandPilot`; the current PTS primitive is labeled `PTS`; the old exact
+PTS primitive is labeled `legacy-PTS`; and the legacy tree-search primitive is
+labeled `tree`.
+
+Use `evaluation/baselines/` to train and compare reviewer-facing baselines such as `CasCore`, `BWGreedy`, and `LinearBW`.
+
+Use `evaluation/scalability/` to rebuild the scalability-latency pipeline. The evidence boundaries are explicit: 32-GPU dispatch latency is `measured`, 64-1024 GPU scaled traces are `simulated`, and 2048-4096 GPU control-plane bounds are `synthesized`.
+
+Use `evaluation/sensitivity-analysis/` and `training/sample_sensitivity_*` for predictor-level and dispatch-level sample-sensitivity studies.
+
+Use `evaluation/llm_tp_bandwidth/` as an optional `measured` sidecar for two-GPU tensor-parallel LLM bandwidth sensitivity. This sidecar requires local model paths and a CUDA/NCCL environment.
+
+## Citation
 
 ```bibtex
 @article{zhang2026bandpilot,
@@ -21,173 +81,6 @@ If you find this repository useful in your research, please cite:
 }
 ```
 
-## Environment
-
-- **Python**: recommended 3.8+ (see `requirements.txt` for details)
-- **Deep learning framework**: PyTorch (version as specified in `requirements.txt`)
-- **OS**: Linux (the experiments in the paper were conducted on Linux-based clusters)
-- **Hardware**:
-  - H100 GPU cluster with 4*8 GPU for H100 experiments
-  - Heterogeneous 4-node (Het-4Mix) cluster (4090 / A800 / A6000 / V100, each with 8 GPUs) for heterogeneous experiments
-
-We strongly recommend creating a fresh virtual environment and installing dependencies via:
-
-```bash
-pip install -r requirements.txt
-```
-
-## Directory Structure
-
-```text
-BandPilot/
-├── main.py                  # Entry point to read config and drive training/evaluation
-├── config/                  # YAML configs
-├── core/                    # Bandwidth lookup, topology, GPU configs, and cluster state
-├── models/                  # Neural network models (BandwidthPredictor)
-├── data_process/            # Data preprocessing, sample generation, and DataLoader
-├── algorithms/              # Search and heuristic algorithms
-├── training/                # Training and offline evaluation wrappers
-├── evaluation/              # Upper-bound estimation and single-contention experiments
-├── utils/                   # IO, path, and other helpers
-├── Data/                    # Raw/processed data, bandwidth dictionaries, evaluation results
-└── model/                   # Model weights and scaler directories per cluster type
-```
-
-## Installation
-
-```bash
-cd BandPilot    # or the repo root
-pip install -r requirements.txt
-```
-
-## Quick Start
-
-To run a complete training + evaluation pipeline with the default configuration:
-
-```bash
-cd BandPilot
-python main.py --config config/default_config.yaml
-```
-
-The default config in `config/default_config.yaml` sets data paths, model structure, training hyperparameters, and cluster/bandwidth parameters. Adjust as needed.
-
-
-## Training Config
-
-The `training` section of `config/default_config.yaml` contains:
-
-- `enable_training`: Whether to run model training (default `true`).
-  - `true`: Run training and save the model to  
-    `{model_save_dir}/{cluster_type}/bandwidth_predictor_ns{num_train_samples}.pth`,  
-    and write `active_num_train_samples.txt` to auto-select the matching scaler during inference/evaluation.
-  - `false`: Skip training and directly load an existing model (from the same-suffix default path).  
-    - If the file is missing, a `FileNotFoundError` will be raised.  
-    - Suitable when a trained model already exists and only evaluation is needed.
-
-Other key training parameters:
-
-- `batch_size`, `num_epochs`, `learning_rate`, `weight_decay`, `patience`, `lambda_ewc`, etc.
-- `num_train_samples`: Number of training samples.
-- `num_test_samples`: Number of random test samples for quick post-training checks.
-
-## Evaluation and Experiment Config
-
-The current version evaluates algorithms via **offline `max_bw` upper-bound estimation + single-contention experiments**, configured in the `evaluation` section:
-
-- `max_bw_offline`: Offline collection of theoretical bandwidth upper bound `max_bw` under given contention modes. Results are saved to  
-  `Data/Evaluation/{cluster_type}/MaxBW_*.csv`, and single-contention experiments always consume this cache.
-- `enable_single_contention`: Whether to run single-dispatch + background-contention experiments (`single_dispatch_with_contention`):
-  - `single_contention.repeat_num`: Repetitions per `test_num`.
-  - `single_contention.if_dynamic`: Whether to sample available GPUs dynamically.
-  - `single_contention.contention_mode`: Contention mode list (e.g., `['intensive', 'common', 'idle']`).
-  - `single_contention.search_if_real_data`: Whether search uses real data directly.
-
-In `max_bw_offline` you can further control search accuracy and budget:
-
-- `local_top_k`: Local candidates retained per node.
-- `max_combos_per_distribution`: Candidate cap per node distribution.
-- `max_total_combos`: Global cap on evaluated combinations to keep runtime bounded.
-
-The main program first collects upper bounds via `max_bw_offline`, then (if `enable_single_contention = true`) reads the cache and runs single-contention experiments, outputting  
-`Data/Evaluation/{cluster_type}/Single_contention_*.csv`.
-
-
-### Sequential execution for multiple configs (single_contention / max_bw_offline)
-
-- `evaluation.single_contention` and `evaluation.max_bw_offline` allow `repeat_num` and `contention_mode` to be lists; they will be enumerated in order.
-- `max_bw_offline` generates a separate cache file for each `(contention_mode, repeat_num)`, and `single_contention` automatically matches the cache and writes result files.
-- Example:
-
-  ```yaml
-  evaluation:
-    enable_single_contention: true
-    single_contention:
-      repeat_num: [30, 50]
-      contention_mode: ['common', 'intensive']
-      if_dynamic: true
-      search_if_real_data: false
-    max_bw_offline:
-      enable: true
-      repeat_num: [30, 50]
-      contention_mode: ['common', 'intensive']
-      if_dynamic: true
-      search_if_real_data: true
-      local_top_k: 10
-      max_combos_per_distribution: 2048
-      max_total_combos: 200000
-  ```
-
-- `contention_mode` is case/whitespace-insensitive and will be normalized to lowercase for cache and result filenames (e.g., YAML `Intensive` is treated as `intensive`).
-
-## Reproducing the Paper Results
-
-This repository is designed so that the main experiments in the paper can be reproduced via configuration files under `config/`.
-At a high level, the workflow is:
-
-1. **Prepare data and models** 
-2. **Select the target cluster type and experiment settings** in a YAML config under `config/` (e.g., cluster topology, contention modes, training hyperparameters).
-3. **Run the pipeline**:
-
-   ```bash
-   python main.py --config config/default_config.yaml
-   ```
-
-4. **Collect evaluation outputs** from:
-   - `Data/Evaluation/{cluster_type}/MaxBW_*.csv` for offline `max_bw` upper-bound estimation.
-   - `Data/Evaluation/{cluster_type}/Single_contention_*.csv` for single-dispatch + background-contention experiments.
-
-Depending on your exact config, these CSVs correspond to the tables and figures reported in the paper (e.g., main comparison on H100, ablation on search budget, Het-4Mix experiments).
-You can create additional YAML configs (e.g., variants of `default_config.yaml`) to mirror specific experimental settings described in the paper.
-
-
-## Het-4Mix Cluster
-
-- `Het-4Mix` stitches four 8-GPU servers (4090 / A800 / A6000 / V100) into a 32-GPU heterogeneous cluster. It can be configured alongside H100 in `config/default_config.yaml` under `cluster.cluster_types`, e.g.:
-
-  ```yaml
-  cluster:
-    total_gpu: 32
-    cluster_types:
-      - 'H100_26H100_27H100_28H100_29'
-      - 'Het-4Mix'
-  ```
-
-- The four GPU types only provide intra-node (8-GPU) bandwidth dictionaries; cross-node bandwidth reuses the default H100 CSV.
-  Final communication bandwidth takes the bottleneck between H100 cross-node results and the minimum intra-node bandwidth, preventing overestimation for heterogeneous nodes.
-- All Het-4Mix evaluation results are written to `Data/Evaluation/Het-4Mix/`, and model weights are saved to `model/Het-4Mix/`.
-
-## Next Steps / Roadmap
-
-- Extend evaluation statistics/visualization in `evaluation` as needed.
-- Add unit tests to cover core modules.
-- Migrate more experiment entry points from the original script into `main.py`.
-
-## License
-
-This project is currently intended for academic research use.  
-
 ## Contact
 
-For questions, feedback, or collaboration, please contact the corresponding author(s):  
-`kzhang519@connect.hkust-gz.edu.cn`  
-
+For questions about the artifact, contact the corresponding author at `kzhang519@connect.hkust-gz.edu.cn`.

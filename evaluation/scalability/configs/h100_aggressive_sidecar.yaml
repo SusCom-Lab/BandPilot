@@ -1,0 +1,144 @@
+# H100 aggressive PTS-unit scalability sidecar.
+#
+# Run:
+#   python main.py --config evaluation/scalability/configs/h100_aggressive_sidecar.yaml
+#
+# This config enables hu_unit_gate.aggressive=true for H100 only and writes
+# regenerated outputs under evaluation/scalability/artifacts/.
+
+data:
+  h100_training_data_path: './Data/H100/Pune_H100_16M_binary.csv'
+  h100_evaluation_data_path: './Data/H100/Pune_H100_2GB_binary.csv'
+  bandwidth_dict_dir: './Data/Bandwidth'
+  model_save_dir: './model'
+  evaluation_dir: './Data/Evaluation/'
+
+model:
+  type: 'full'
+  hidden_dim: 32
+  num_layers: 6
+  num_heads: 8
+  dropout: 0.05
+  node_count_embedding_dim: 8
+
+training:
+  enable_training: false
+  batch_size: 100
+  num_epochs: 300
+  learning_rate: 0.001
+  weight_decay: 0.00001
+  patience: 80
+  lambda_ewc: 2.0
+  num_train_samples: 250
+  num_test_samples: 2500
+
+cluster:
+  total_gpu: 32
+  cluster_types:
+    - 'H100_26H100_27H100_28H100_29'
+  bw_switch: 1111
+
+evaluation:
+  enable_single_contention: false
+  adaptive_threshold_policy:
+    mode: 'homogeneity_split'
+    homogeneous:
+      cv_threshold: 0.10
+      gap_threshold: 0.08
+      min_candidates_for_cv: 4
+    heterogeneous:
+      cv_threshold: 0.10
+      gap_threshold: 0.06
+      min_candidates_for_cv: 4
+
+  single_contention:
+    repeat_num: 50
+    if_dynamic: true
+    contention_mode:
+    - 'intensive'
+    - 'common'
+    - 'idle'
+    search_if_real_data: false
+
+  max_bw_offline:
+    enable: false
+    repeat_num: 50
+    if_dynamic: true
+    contention_mode:
+    - 'intensive'
+    - 'common'
+    - 'idle'
+    search_if_real_data: true
+    local_top_k: 10
+    max_combos_per_distribution: 2048
+    max_total_combos: 200000
+
+  sensitivity_analysis:
+    enable: false
+    sample_sizes: [25, 50, 75, 100, 150, 200, 250, 300, 400, 500]
+    strategies: ['Random', 'Stratified', 'Worst-Case']
+    num_seeds: 20
+    master_seed: 42
+    num_test_samples: 2500
+    output_dir: './evaluation/sensitivity-analysis/artifacts/predictor-level'
+
+  scalability_benchmark:
+    enable: true
+    output_dir: './evaluation/scalability/artifacts/benchmark/current/search_overhead_h100_aggressive_sidecar'
+    log_level: 'INFO'
+    clear_cache: true
+    resume: false
+    save_every_n_records: 1
+    algorithms: ['EHA', 'PTS', 'BandPilot']
+    hu_unit_gate:
+      aggressive: true
+    adaptive_runtime_policy:
+      mode: 'online_knn'
+      output_algorithm_label: 'BandPilot'
+      fallback_backend_label: 'PTS'
+      policy_name: 'adaptive_knn'
+      top_k: 5
+      bootstrap_draws: 256
+      relative_noise_floor: 0.02
+      bw_improvement_threshold_pct_of_bandpilot: 0.5
+      k_neighbors: 5
+      same_contention_only: true
+      min_support: 5
+      low_trust_conflict_risk_threshold: 0.30
+      risk_threshold: 0.15
+
+    public_view:
+      public_algorithms: ['EHA', 'PTS', 'BandPilot']
+      upper_bound_algorithm: null
+      representative_contention_mode: 'common'
+      representative_avail_ratio: 0.7
+      representative_inter_pod_factor: 0.7
+      representative_k_values: [16, 64]
+      envelope_contention_modes: ['common', 'intensive']
+
+    real_dispatch:
+      k_values: [4, 8, 12, 16, 20, 24, 28]
+      contention_modes: ['idle', 'common', 'intensive']
+      repeat_num: 50
+      algorithms: ['EHA', 'PTS', 'BandPilot']
+
+    scaled_search:
+      gpu_counts: [64, 128, 256, 512, 1024]
+      k_values: [8, 16, 32, 64]
+      avail_ratios: [0.5, 0.7, 0.9]
+      contention_modes: ['common', 'intensive']
+      inter_pod_factors: [0.5, 0.7]
+      repeat_num: 10
+      repeat_num_public_slice: 20
+      algorithms: ['EHA', 'PTS', 'BandPilot']
+
+    predictor_profile:
+      inference_node_counts: [4, 8, 16, 32, 64, 128, 256, 512]
+      inference_repeats: 200
+
+    latency_synthesis:
+      target_gpu_counts: [512, 1024, 2048, 4096]
+
+random_seed:
+  - 1111
+device: 'cuda'

@@ -1,38 +1,24 @@
-"""Refactored GPU scheduling entrypoint."""
+"""Public BandPilot training and evaluation entry point.
+
+The module keeps heavyweight ML and data-processing imports inside `main()` so
+`python main.py --help` remains a lightweight self-documenting command. This is
+important for artifact evaluators who first inspect available CLI options before
+installing GPU-specific runtime dependencies.
+"""
 from __future__ import annotations
-"""python main.py --config config/default_config.yaml"""
+
 import argparse
 import logging
 import random
 from pathlib import Path
 from typing import List
 
-import numpy as np
-import torch
-import yaml
-
 logger = logging.getLogger(__name__)
-
-from core.bandwidth import SwitchBandwidthConfig, get_gpu_dict_files, load_gpu_bw_dict
-from core.cluster_state import normalize_contention_mode
-from evaluation.compare import (
-
-    get_single_dispatch_with_contention_data,
-    collect_single_contention_max_bw_data,
-    build_single_experiment_filename,
-    build_max_bw_cache_filename,
-)
-from training.trainer import model_train_pipeline
-from utils.helpers import ensure_directory, build_artifact_filename, record_active_num_train_samples
-
-# Import algorithm functions
-from algorithms.baseline import default_algo, random_algo
-from algorithms.eha import eha_search
-from algorithms.search import improved_searching_algo, tree_search_only
-from algorithms.slurm import slurm_best_fit_algo
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse CLI options for the public training/evaluation entry point."""
+
     parser = argparse.ArgumentParser(description="GPU Bandwidth Dispatcher")
     parser.add_argument(
         "--config",
@@ -51,11 +37,16 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_config(config_path: Path) -> dict:
+    import yaml
+
     with config_path.open("r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
 def set_seed(seed: int) -> None:
+    import numpy as np
+    import torch
+
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -63,6 +54,8 @@ def set_seed(seed: int) -> None:
 
 
 def load_gpu_bandwidth_dicts(bandwidth_dir: Path, file_list: List[str]):
+    from core.bandwidth import load_gpu_bw_dict
+
     dicts = []
     for filename in file_list:
         dicts.append(load_gpu_bw_dict(bandwidth_dir / filename))
@@ -79,6 +72,35 @@ def _ensure_list(value):
 
 def main() -> None:
     args = parse_args()
+
+    import torch
+
+    from core.bandwidth import SwitchBandwidthConfig, get_gpu_dict_files
+    from core.cluster_state import normalize_contention_mode
+    from evaluation.compare import (
+        build_max_bw_cache_filename,
+        build_single_experiment_filename,
+        collect_single_contention_max_bw_data,
+        get_single_dispatch_with_contention_data,
+    )
+    from evaluation.scalability import CURRENT_BENCHMARK_ARTIFACT_DIR
+    from evaluation.scalability.benchmark import (
+        make_real_cluster_config,
+        run_scalability_benchmark_suite,
+    )
+    from training.sample_sensitivity_experiment import (
+        DEFAULT_SAMPLE_SIZES,
+        STRATEGY_GENERATORS,
+        plot_sensitivity_figures,
+        run_sensitivity_experiment,
+    )
+    from training.trainer import model_train_pipeline
+    from utils.helpers import (
+        build_artifact_filename,
+        ensure_directory,
+        record_active_num_train_samples,
+    )
+
     config = load_config(args.config)
     
     # Support random_seed as single value or list
@@ -112,6 +134,8 @@ def main() -> None:
         # Set seed per experiment group
         set_seed(random_seed)
         logger.info(f"========== Start experiment random_seed={random_seed} ==========")
+        scalability_cfg = eval_cfg.get("scalability_benchmark", {})
+        benchmark_cluster_configs = []
 
         for cluster_type in cluster_cfg["cluster_types"]:
             is_h100_cluster = "H100" in cluster_type
@@ -168,6 +192,55 @@ def main() -> None:
                 )
                 print(f"[seed={random_seed}] {cluster_type} using existing model: {model_path}")
                 record_active_num_train_samples(artifact_dir, num_train_samples)
+
+            if scalability_cfg.get("enable", False):
+                benchmark_cfg = make_real_cluster_config(
+                    cluster_type=cluster_type,
+                    total_gpu=total_gpu,
+                    gpu_bw_dict_list=gpu_bw_dict_list,
+                    switch_config=switch_config,
+                    model_path=model_path,
+                    model_cfg=model_cfg,
+                    training_data_path=training_data_path,
+                    evaluation_data_path=evaluation_data_path,
+                    artifact_dir=artifact_dir,
+                    device=device,
+                    adaptive_runtime_policy=scalability_cfg.get("adaptive_runtime_policy"),
+                    hu_unit_gate=scalability_cfg.get("hu_unit_gate"),
+                )
+                benchmark_cluster_configs.append(benchmark_cfg)
+
+            # ==================== Sensitivity Analysis ====================
+            sens_cfg = eval_cfg.get("sensitivity_analysis", {})
+            if sens_cfg.get("enable", False):
+                import pandas as pd
+                sens_output = Path(
+                    sens_cfg.get(
+                        "output_dir",
+                        "./evaluation/sensitivity-analysis/artifacts/predictor-level",
+                    )
+                )
+                ensure_directory(sens_output)
+                sens_df = run_sensitivity_experiment(
+                    cluster_type=cluster_type,
+                    total_gpu=total_gpu,
+                    gpu_bw_dict_list=gpu_bw_dict_list,
+                    switch_config=switch_config,
+                    training_data_path=training_data_path,
+                    model_cfg=model_cfg,
+                    training_cfg=training_cfg,
+                    sample_sizes=sens_cfg.get("sample_sizes", DEFAULT_SAMPLE_SIZES),
+                    strategies=sens_cfg.get("strategies", list(STRATEGY_GENERATORS.keys())),
+                    num_seeds=sens_cfg.get("num_seeds", 5),
+                    master_seed=sens_cfg.get("master_seed", 42),
+                    num_test_samples=sens_cfg.get("num_test_samples", 2500),
+                    device=device,
+                    output_dir=sens_output,
+                )
+                csv_path = sens_output / f"sensitivity_{cluster_type}.csv"
+                sens_df.to_csv(csv_path, index=False)
+                print(f"[seed={random_seed}] Sensitivity results saved to {csv_path}")
+                # Plot after all clusters finish (handled outside the loop)
 
             max_bw_offline_cfg = eval_cfg.get("max_bw_offline", {})
             max_bw_cache_files = {}
@@ -259,10 +332,13 @@ def main() -> None:
                         ]
                         single_if_dynamic = single_cont_cfg.get("if_dynamic", eval_cfg.get("if_dynamic", True))
                         single_search_real = single_cont_cfg.get("search_if_real_data", False)
+                        adaptive_runtime_policy = dict(
+                            single_cont_cfg.get("adaptive_runtime_policy", {})
+                        )
                         num_train_samples = int(training_cfg.get("num_train_samples", 0))
 
-                        for single_contention in single_contention_list:
-                            for single_repeat in single_repeat_list:
+                        for single_repeat in single_repeat_list:
+                            for single_contention in single_contention_list:
                                 max_bw_cache_file = max_bw_cache_files.get((single_contention, single_repeat))
                                 if max_bw_cache_file is None:
                                     # If not generated this run, locate existing cache by naming rule
@@ -301,6 +377,13 @@ def main() -> None:
                                     contention_mode=single_contention,
                                     search_if_real_data=single_search_real,
                                     max_bw_cache_file=max_bw_cache_file,
+                                    adaptive_threshold_policy=single_cont_cfg.get(
+                                        "adaptive_threshold_policy",
+                                        eval_cfg.get("adaptive_threshold_policy"),
+                                    ),
+                                    adaptive_runtime_policy=adaptive_runtime_policy,
+                                    hu_unit_gate=single_cont_cfg.get("hu_unit_gate"),
+                                    baseline_config=single_cont_cfg.get("baselines"),
                                 )
 
                                 single_cont_stem = build_single_experiment_filename(
@@ -319,9 +402,24 @@ def main() -> None:
                                     f"(contention_mode={single_contention}, repeat_num={single_repeat})"
                                 )
 
+        if scalability_cfg.get("enable", False) and benchmark_cluster_configs:
+            output_dir = Path(
+                scalability_cfg.get("output_dir", str(CURRENT_BENCHMARK_ARTIFACT_DIR))
+            )
+            ensure_directory(output_dir)
+            # The scalability benchmark may build larger virtual clusters
+            # from each configured cluster template.
+            run_scalability_benchmark_suite(
+                cluster_configs=benchmark_cluster_configs,
+                benchmark_cfg=scalability_cfg,
+                output_dir=output_dir,
+                random_seed=random_seed,
+            )
+            print(f"[seed={random_seed}] scalability benchmark artifacts saved to {output_dir}")
+
 
 if __name__ == "__main__":
-    #python main.py --config config/default_config.yaml
     import os
+
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     main()
