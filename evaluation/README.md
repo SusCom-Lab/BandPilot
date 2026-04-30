@@ -9,7 +9,6 @@ This directory contains source code for reproducing the BandPilot evaluation wor
 - `baselines/`: reviewer-facing baseline suite source.
 - `scalability/`: scalability-latency benchmark source with measured, simulated, and synthesized stages.
 - `sensitivity-analysis/`: predictor-level and dispatch-level sample-sensitivity source.
-- `llm_tp_bandwidth/`: optional measured two-GPU tensor-parallel LLM sidecar.
 
 ## Generated Outputs
 
@@ -27,7 +26,7 @@ Regenerate these outputs from the scripts and configs when reproducing the paper
 
 Keep evidence labels explicit:
 
-- `measured`: directly collected on the target hardware or sidecar environment.
+- `measured`: directly collected on the target hardware or local measurement environment.
 - `simulated`: replayed or scaled from measured/source traces.
 - `synthesized`: bounded control-plane or analytical construction.
 - `theoretical`: derived from formulas or model assumptions only.
