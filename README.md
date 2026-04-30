@@ -2,8 +2,6 @@
 
 This repository contains the public reproduction source for **BandPilot: Towards Performance- and Contention-Aware GPU Dispatching in AI Clusters**.
 
-The public tree is intentionally source-only. Generated experiment results, trained checkpoints, caches, internal revision logs, paper PDFs, and private workspace automation have been removed. The retained files are sufficient to inspect the implementation and rerun the reported workflows with the provided input data and configuration templates.
-
 ## Repository Layout
 
 ```text
@@ -59,13 +57,6 @@ the single-contention dispatch evaluation used by the paper workflow.
 The reported algorithms are implemented under `algorithms/`. In regenerated
 single-contention tables, `BandPilot` refers to the current mainline path in
 `algorithms/search.py`; legacy variants are kept only for comparison labels.
-
-Additional reproduction drivers are grouped by study:
-
-- `evaluation/baselines/` compares BandPilot against baseline dispatchers.
-- `evaluation/scalability/` rebuilds scalability-latency experiments.
-- `evaluation/sensitivity-analysis/` and `training/sample_sensitivity_*` run sample-sensitivity studies.
-- `evaluation/llm_tp_bandwidth/` contains the optional CUDA/NCCL sidecar for two-GPU tensor-parallel bandwidth measurements.
 
 Generated artifacts are intentionally not part of the public source tree. After
 rerunning workflows, expect outputs under ignored paths such as `model/`,
