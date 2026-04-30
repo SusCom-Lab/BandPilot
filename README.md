@@ -1,6 +1,6 @@
 # BandPilot
 
-This repository contains the public reproduction source for **BandPilot: Towards Performance- and Contention-Aware GPU Dispatching in AI Clusters**.
+This repository contains the public reproduction source for **[BandPilot: Towards Performance- and Contention-Aware GPU Dispatching in AI Clusters](https://arxiv.org/abs/2506.15595)**.
 
 ## Repository Layout
 
