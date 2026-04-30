@@ -48,26 +48,31 @@ Run the default training and single-contention evaluation workflow:
 python main.py --config config/default_config.yaml
 ```
 
-The default config reads source inputs from `Data/H100`, `Data/Bandwidth`, and `Data/Topology`. It writes regenerated checkpoints and evaluation results to ignored output directories, so a clean public checkout remains source-only after results are removed.
+The default workflow reads the public inputs under `Data/` and writes regenerated
+checkpoints, CSVs, and figures to ignored output directories.
 
-## Main Reproduction Workflows
+## Reproduction Workflows
 
-Use `config/default_config.yaml` for the main H100 and Het-4Mix training/evaluation pipeline. It controls data paths, model hyperparameters, training sample budgets, cluster topology, contention modes, offline `MaxBW_*` cache generation, and single-contention evaluation.
+The main entry point is `main.py`, which trains the bandwidth predictor and runs
+the single-contention dispatch evaluation used by the paper workflow.
 
-In the single-contention workflow, the public `BandPilot` row is the current
-`search.py` mainline path: EHA candidate pruning, runtime kNN PTS gating, and
-current PTS refinement. The old exact-PTS BandPilot path is labeled
-`legacy-BandPilot`; the current PTS primitive is labeled `PTS`; the old exact
-PTS primitive is labeled `legacy-PTS`; and the legacy tree-search primitive is
-labeled `tree`.
+The reported algorithms are implemented under `algorithms/`. In regenerated
+single-contention tables, `BandPilot` refers to the current mainline path in
+`algorithms/search.py`; legacy variants are kept only for comparison labels.
 
-Use `evaluation/baselines/` to train and compare reviewer-facing baselines such as `CasCore`, `BWGreedy`, and `LinearBW`.
+Additional reproduction drivers are grouped by study:
 
-Use `evaluation/scalability/` to rebuild the scalability-latency pipeline. The evidence boundaries are explicit: 32-GPU dispatch latency is `measured`, 64-1024 GPU scaled traces are `simulated`, and 2048-4096 GPU control-plane bounds are `synthesized`.
+- `evaluation/baselines/` compares BandPilot against baseline dispatchers.
+- `evaluation/scalability/` rebuilds scalability-latency experiments.
+- `evaluation/sensitivity-analysis/` and `training/sample_sensitivity_*` run sample-sensitivity studies.
+- `evaluation/llm_tp_bandwidth/` contains the optional CUDA/NCCL sidecar for two-GPU tensor-parallel bandwidth measurements.
 
-Use `evaluation/sensitivity-analysis/` and `training/sample_sensitivity_*` for predictor-level and dispatch-level sample-sensitivity studies.
+Generated artifacts are intentionally not part of the public source tree. After
+rerunning workflows, expect outputs under ignored paths such as `model/`,
+`Data/Evaluation/`, and `evaluation/**/artifacts/`.
 
-Use `evaluation/llm_tp_bandwidth/` as an optional `measured` sidecar for two-GPU tensor-parallel LLM bandwidth sensitivity. This sidecar requires local model paths and a CUDA/NCCL environment.
+See the README files inside each subdirectory for command-level details when
+rerunning a specific study.
 
 ## Citation
 
@@ -80,7 +85,3 @@ Use `evaluation/llm_tp_bandwidth/` as an optional `measured` sidecar for two-GPU
   url     = {https://arxiv.org/abs/2506.15595}
 }
 ```
-
-## Contact
-
-For questions about the artifact, contact the corresponding author at `kzhang519@connect.hkust-gz.edu.cn`.
